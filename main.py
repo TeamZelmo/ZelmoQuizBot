@@ -5,8 +5,8 @@ import time
 import asyncio
 from aiohttp import web
 from groq import AsyncGroq
-from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatMemberStatus, ParseMode
+from pyrogram import Client, filters, idle, raw
+from pyrogram.enums import ChatMemberStatus, ParseMode, PollType
 from pyrogram.types import (
     Message,
     BotCommand,
@@ -39,8 +39,6 @@ GROQ_MODELS = [
 raw_chats = os.getenv("ALLOWED_CHAT_IDS", "")
 ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in raw_chats.split(",") if cid.strip()]
 
-LETTERS = ["क", "ख", "ग", "घ"]
-
 app = Client(
     "competition_ca_bot",
     api_id=API_ID,
@@ -52,6 +50,8 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # chat_id -> सत्र (session)
 SESSIONS = {}
+# poll_id (संख्या) -> chat_id
+POLL_TO_CHAT = {}
 
 
 async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
@@ -80,17 +80,6 @@ async def safe_send(client: Client, chat_id: int, text: str, **kwargs):
         return await client.send_message(chat_id, plain, parse_mode=ParseMode.DISABLED, **kwargs)
 
 
-async def safe_edit(message: Message, text: str):
-    try:
-        await message.edit_text(text)
-    except Exception as e:
-        print(f"⚠️ संदेश संपादन में दिक्कत, सादा रूप आज़मा रहे हैं: {e}")
-        try:
-            await message.edit_text(text.replace("**", "").replace("`", ""), parse_mode=ParseMode.DISABLED)
-        except Exception as e2:
-            print(f"❌ संपादन विफल: {e2}")
-
-
 async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
     avoid_text = ""
     if avoid:
@@ -107,7 +96,7 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
     3. If the topic is static (History, Polity, Geography, Science, Math, Reasoning, Bihar Special), frame a concept-based or factually accurate question.
     4. If the topic is Current Affairs, focus on real verified developments, schemes, indices, or appointments.
     5. LANGUAGE: Write the question, all options and the explanation in pure, standard Hindi using Devanagari script (शुद्ध हिंदी). Do not use Roman/Hinglish. Use English only where an official abbreviation is unavoidable.
-    6. Keep question under 250 characters, each option under 90 characters, explanation under 250 characters.
+    6. Keep question under 220 characters, each option under 90 characters, explanation under 180 characters.
     7. Provide exactly 4 distinct options and 1 concise factual explanation.
     8. Return RAW JSON ONLY without any markdown backticks.{avoid_text}
 
@@ -133,12 +122,12 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
             content = content.replace("```json", "").replace("```", "").strip()
             data = json.loads(content)
 
-            options = [clean(o)[:100] for o in data["options"][:4]]
+            options = [str(o).strip()[:100] for o in data["options"][:4]]
             cid = int(data["correct_option_id"])
             if len(options) < 2 or not (0 <= cid < len(options)):
                 raise ValueError("मॉडल से अमान्य प्रश्न मिला")
-            data["question"] = clean(data["question"])
-            data["explanation"] = clean(data.get("explanation", ""))
+            data["question"] = str(data["question"]).strip()
+            data["explanation"] = str(data.get("explanation", "")).strip()
             data["options"] = options
             data["correct_option_id"] = cid
             return data
@@ -149,38 +138,100 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
     raise RuntimeError(" | ".join(errors))
 
 
-# ==================== प्रश्न संदेश ====================
+# ==================== वोट दर्ज करना ====================
 
-def question_text(i: int, total: int, data: dict) -> str:
-    opts = "\n".join(f"**{LETTERS[k]})** {o}" for k, o in enumerate(data["options"]))
-    return (
-        f"📝 **प्रश्न {i}/{total}**   ⏱ समय: `{TIMER_SECONDS}` सेकंड\n\n"
-        f"{data['question']}\n\n{opts}\n\n"
-        f"👇 नीचे दिए बटन से अपना उत्तर चुनें"
-    )
+def record_vote(session: dict, q: dict, uid: int, name: str, chosen: int, elapsed: float):
+    """एक उपयोगकर्ता का एक प्रश्न का उत्तर दर्ज करना (दोहराव से बचाव सहित)।"""
+    if uid in q["voted"]:
+        return
+    is_right = (chosen == q["correct"])
+    q["voted"][uid] = is_right
+
+    s = session["scores"].setdefault(uid, {"name": name, "correct": 0, "wrong": 0, "time": 0.0})
+    if is_right:
+        s["correct"] += 1
+    else:
+        s["wrong"] += 1
+    s["time"] += max(elapsed, 0.0)
 
 
-def result_text(i: int, total: int, data: dict, q: dict) -> str:
-    c = data["correct_option_id"]
-    lines = []
-    for k, o in enumerate(data["options"]):
-        mark = "✅" if k == c else "▫️"
-        lines.append(f"{mark} **{LETTERS[k]})** {o}")
+def raw_user_name(user, uid: int) -> str:
+    if user:
+        full = (getattr(user, "first_name", "") or "")
+        last = getattr(user, "last_name", "") or ""
+        if last:
+            full += " " + last
+        full = clean(full)
+        if full:
+            return full
+    return f"उपयोगकर्ता {uid}"
 
-    answered = len(q["answers"])
-    right = sum(1 for ok in q["answers"].values() if ok)
 
-    text = (
-        f"📝 **प्रश्न {i}/{total}**   ⏰ समय समाप्त\n\n"
-        f"{data['question']}\n\n" + "\n".join(lines) + "\n\n"
-        f"✅ **सही उत्तर:** {LETTERS[c]}) {data['options'][c]}\n"
-    )
-    if data.get("explanation"):
-        text += f"💡 **व्याख्या:** {data['explanation']}\n"
-    text += f"\n📊 उत्तर देने वाले: `{answered}`   सही: `{right}`   गलत: `{answered - right}`"
-    if q["first_correct"]:
-        text += f"\n⚡ **सबसे पहले सही उत्तर:** {q['first_correct']}"
-    return text
+@app.on_raw_update(group=-1)
+async def vote_tracker(client, update, users, chats):
+    """वोट आते ही तुरंत दर्ज करना।"""
+    if not isinstance(update, raw.types.UpdateMessagePollVote):
+        return
+
+    try:
+        poll_id = int(update.poll_id)
+        chat_id = POLL_TO_CHAT.get(poll_id)
+        if chat_id is None:
+            return
+
+        session = SESSIONS.get(chat_id)
+        if not session:
+            return
+
+        q = session["polls"].get(poll_id)
+        if not q or not update.options:
+            return
+
+        user_id = getattr(update.peer, "user_id", None)
+        if user_id is None:
+            return
+
+        chosen = update.options[0][0]  # विकल्प का क्रमांक
+        elapsed = time.time() - q["sent_at"]
+        name = raw_user_name(users.get(user_id), user_id)
+        print(f"🗳 वोट मिला: प्रश्न {q['no']}, {name}, विकल्प {chosen}")
+        record_vote(session, q, user_id, name, chosen, elapsed)
+    except Exception as e:
+        print(f"⚠️ वोट दर्ज करने में त्रुटि: {e}")
+
+
+async def reconcile_votes(client: Client, chat_id: int, q: dict, session: dict):
+    """समय पूरा होने पर टेलीग्राम से मतदाताओं की सूची निकालकर छूटे हुए वोट जोड़ना।"""
+    try:
+        peer = await client.resolve_peer(chat_id)
+        for k in range(q["n_options"]):
+            res = await client.invoke(
+                raw.functions.messages.GetPollVotes(
+                    peer=peer,
+                    id=q["message_id"],
+                    limit=100,
+                    option=bytes([k])
+                )
+            )
+            user_map = {u.id: u for u in res.users}
+            for v in res.votes:
+                uid = getattr(v.peer, "user_id", None)
+                if uid is None:
+                    continue
+                vote_date = getattr(v, "date", None)
+                elapsed = (vote_date - int(q["sent_at"])) if isinstance(vote_date, int) else q["limit"]
+                name = raw_user_name(user_map.get(uid), uid)
+                record_vote(session, q, uid, name, k, elapsed)
+    except Exception as e:
+        print(f"⚠️ मतदाता सूची से मिलान में दिक्कत (live वोट फिर भी गिने गए): {type(e).__name__}: {e}")
+
+    # हर विकल्प के कुल वोट सीधे टेलीग्राम से (उपयोगकर्ता-वार सूची न मिले तब भी काम आता है)
+    try:
+        msg = await client.get_messages(chat_id, q["message_id"])
+        q["summary"] = [int(o.voter_count) for o in msg.poll.options]
+    except Exception as e:
+        print(f"⚠️ कुल वोट की गिनती नहीं मिली: {type(e).__name__}: {e}")
+    print(f"📊 प्रश्न {q['no']}: दर्ज उपयोगकर्ता={len(q['voted'])}, टेलीग्राम गिनती={q['summary']}")
 
 
 # ==================== परिणाम तालिका ====================
@@ -189,8 +240,31 @@ def build_leaderboard(session: dict, finished: bool = True) -> str:
     total = session["asked"]
     scores = session["scores"]
 
+    # प्रश्न-वार सारांश (टेलीग्राम की कुल गिनती से)
+    summary_lines = []
+    any_votes = False
+    for q in sorted(session["polls"].values(), key=lambda x: x["no"]):
+        counts = q.get("summary")
+        if not counts:
+            continue
+        got = sum(counts)
+        right = counts[q["correct"]] if q["correct"] < len(counts) else 0
+        if got:
+            any_votes = True
+        summary_lines.append(
+            f"प्रश्न {q['no']}: कुल उत्तर `{got}` — ✅ सही `{right}`, ❌ गलत `{got - right}`"
+        )
+    summary_block = ("\n\n📋 **प्रश्न-वार सारांश**\n" + "\n".join(summary_lines)) if summary_lines else ""
+
     if not scores:
-        return "😶 किसी ने भी उत्तर नहीं दिया, इसलिए परिणाम तालिका खाली है।"
+        if any_votes:
+            return (
+                "🏁 **प्रश्नोत्तरी समाप्त!**\n\n"
+                "ℹ️ उत्तर तो मिले, पर उपयोगकर्ता-वार जानकारी टेलीग्राम से नहीं मिल सकी। "
+                "कृपया बॉट को समूह में व्यवस्थापक (Admin) बनाकर पुनः प्रयास करें।"
+                + summary_block
+            )
+        return "🏁 **प्रश्नोत्तरी समाप्त!**\n\n😶 किसी ने भी उत्तर नहीं दिया, इसलिए परिणाम तालिका खाली है।"
 
     rows = []
     for uid, s in scores.items():
@@ -202,7 +276,7 @@ def build_leaderboard(session: dict, finished: bool = True) -> str:
     rows.sort(key=lambda r: (-r[1]["correct"], r[1]["time"]))
 
     rank_labels = ["🥇 प्रथम स्थान", "🥈 द्वितीय स्थान", "🥉 तृतीय स्थान"]
-    title = "🏆 **अंतिम परिणाम**" if finished else "📊 **अब तक का परिणाम**"
+    title = "🏁 **प्रश्नोत्तरी समाप्त — 🏆 अंतिम परिणाम**" if finished else "📊 **अब तक का परिणाम**"
     lines = [f"{title}\n📝 कुल प्रश्न: `{total}`\n"]
 
     for i, (uid, s, skipped) in enumerate(rows):
@@ -218,8 +292,9 @@ def build_leaderboard(session: dict, finished: bool = True) -> str:
         lines.append(f"🥈 **द्वितीय:** {rows[1][1]['name']}")
     if len(rows) > 2:
         lines.append(f"🥉 **तृतीय:** {rows[2][1]['name']}")
-    lines.append("\n🙏 सभी प्रतिभागियों का धन्यवाद!")
-    return "\n".join(lines)
+    text = "\n".join(lines) + summary_block
+    text += "\n\n🙏 सभी प्रतिभागियों का धन्यवाद!"
+    return text
 
 
 async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
@@ -245,33 +320,37 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
             if i < total:
                 next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
 
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton(LETTERS[k], callback_data=f"ans|{i}|{k}")
-                for k in range(len(data["options"]))
-            ]])
+            # सही उत्तर निर्धारित किया हुआ क्विज़ पोल
+            sent = await client.send_poll(
+                chat_id=chat_id,
+                question=f"[{i}/{total}] {data['question']}"[:300],
+                options=data["options"],
+                is_anonymous=False,
+                type=PollType.QUIZ,
+                correct_option_id=data["correct_option_id"],
+                explanation=data["explanation"][:200],
+                open_period=TIMER_SECONDS
+            )
 
-            sent = await safe_send(client, chat_id, question_text(i, total, data), reply_markup=keyboard)
-
+            # Pyrogram में poll.id टेक्स्ट होता है, वोट अपडेट में संख्या; इसलिए int में बदलें
+            poll_id = int(sent.poll.id)
+            POLL_TO_CHAT[poll_id] = chat_id
             q = {
+                "no": i,
+                "summary": None,   # हर विकल्प के कुल वोट (Telegram से)
                 "correct": data["correct_option_id"],
+                "n_options": len(data["options"]),
+                "message_id": sent.id,
                 "sent_at": time.time(),
                 "limit": TIMER_SECONDS,
-                "answers": {},        # उपयोगकर्ता -> सही/गलत
-                "first_correct": None,
-                "closed": False
+                "voted": {}
             }
-            session["questions"][i] = q
+            session["polls"][poll_id] = q
             session["asked"] += 1
 
-            # समय पूरा होने तक रुकें
-            await asyncio.sleep(TIMER_SECONDS)
-            q["closed"] = True
-
-            # बटन हटाकर सही उत्तर और व्याख्या दिखाना
-            await safe_edit(sent, result_text(i, total, data, q))
-
-            if i < total:
-                await asyncio.sleep(2)
+            # समय पूरा होने तक रुकें, फिर छूटे वोटों का मिलान
+            await asyncio.sleep(TIMER_SECONDS + 1)
+            await reconcile_votes(client, chat_id, q, session)
 
         await safe_send(client, chat_id, build_leaderboard(session, finished=True))
 
@@ -284,6 +363,8 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
     finally:
         if next_task and not next_task.done():
             next_task.cancel()
+        for pid in list(session["polls"].keys()):
+            POLL_TO_CHAT.pop(pid, None)
         SESSIONS.pop(chat_id, None)
 
 
@@ -419,7 +500,7 @@ async def exam_quiz_handler(client: Client, message: Message):
 
     SESSIONS[chat_id] = {
         "scores": {},
-        "questions": {},
+        "polls": {},
         "asked": 0,
         "task": None
     }
@@ -466,48 +547,6 @@ async def callback_handler(client: Client, query: CallbackQuery):
     global TIMER_SECONDS
     data = query.data or ""
 
-    # ---- प्रश्न का उत्तर ----
-    if data.startswith("ans|"):
-        try:
-            _, qno, idx = data.split("|")
-            qno, idx = int(qno), int(idx)
-        except ValueError:
-            await query.answer()
-            return
-
-        session = SESSIONS.get(query.message.chat.id)
-        q = session["questions"].get(qno) if session else None
-
-        if not q or q["closed"] or (time.time() - q["sent_at"]) > q["limit"] + 1:
-            await query.answer("⏰ इस प्रश्न का समय समाप्त हो चुका है।", show_alert=True)
-            return
-
-        uid = query.from_user.id
-        if uid in q["answers"]:
-            await query.answer("ℹ️ आप इस प्रश्न का उत्तर पहले ही दे चुके हैं।", show_alert=True)
-            return
-
-        elapsed = time.time() - q["sent_at"]
-        name = clean(query.from_user.first_name or "") or f"उपयोगकर्ता {uid}"
-        if query.from_user.last_name:
-            name = f"{name} {clean(query.from_user.last_name)}"
-
-        is_right = (idx == q["correct"])
-        q["answers"][uid] = is_right
-
-        s = session["scores"].setdefault(uid, {"name": name, "correct": 0, "wrong": 0, "time": 0.0})
-        if is_right:
-            s["correct"] += 1
-            if q["first_correct"] is None:
-                q["first_correct"] = name
-        else:
-            s["wrong"] += 1
-        s["time"] += elapsed
-
-        await query.answer("✅ आपका उत्तर दर्ज हो गया।")
-        return
-
-    # ---- सहायता / व्यवस्थाएँ ----
     if data == "btn_help":
         await query.answer()
         await query.message.reply_text(
