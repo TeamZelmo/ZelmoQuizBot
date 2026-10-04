@@ -52,7 +52,7 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
 
 
 async def generate_universal_quiz(user_topic: str) -> dict:
-    """UPSC, SSC, BPSC, Banking, State PCS ya kisi bhi subject ka factual MCQ generate karna."""
+    """UPSC, SSC, BPSC, Banking, State PCS ya kisi bhi syllabus ka factual MCQ generate karna."""
     prompt = f"""
     You are an expert exam setter for Indian competitive exams (UPSC, SSC CGL/CHSL, BPSC, State PCS, Banking, Railway, etc.).
 
@@ -76,15 +76,30 @@ async def generate_universal_quiz(user_topic: str) -> dict:
     }}
     """
 
-    chat_completion = await groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama3-8b-8192",
-        temperature=0.3,
-        response_format={"type": "json_object"}
-    )
+    # Active models fallback system
+    models_to_try = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "mixtral-8x7b-32768"
+    ]
 
-    content = chat_completion.choices[0].message.content.strip()
-    return json.loads(content)
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            chat_completion = await groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model_name,
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            content = chat_completion.choices[0].message.content.strip()
+            return json.loads(content)
+        except Exception as e:
+            print(f"⚠️ Model {model_name} failed: {e}. Trying next model...")
+            last_error = e
+            continue
+
+    raise last_error
 
 
 # ==================== DUMMY WEB SERVER (RENDER PORT BIND FIX) ====================
@@ -100,7 +115,7 @@ async def start_dummy_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Dummy web server listening on port {port} (Render Port Scan Resolved)")
+    print(f"🌐 Dummy web server listening on port {port}")
 
 
 # ==================== COMMAND HANDLERS ====================
@@ -119,7 +134,7 @@ async def start_handler(client: Client, message: Message):
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📖 Help Guide", callback_data="btn_help"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="btn_settings")
+            InlineKeyboardButton("⚙️️ Settings", callback_data="btn_settings")
         ]
     ])
     await message.reply_text(text, reply_markup=buttons)
@@ -158,7 +173,7 @@ async def settings_handler(client: Client, message: Message):
         await message.reply_text("⛔ **Yeh command sirf Owner use kar sakta hai!**")
         return
 
-    text = f"⚙️ **Quiz Settings:**\n\n⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
+    text = f"⚙️️ **Quiz Settings:**\n\n⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("15s", callback_data="set_time_15"),
@@ -306,7 +321,7 @@ async def set_menu_suggestions():
 
 
 async def main():
-    # 1. Dummy Web Server start
+    # 1. Dummy Web Server start (Render requirement)
     await start_dummy_server()
 
     # 2. Pyrogram start
@@ -318,7 +333,7 @@ async def main():
     asyncio.create_task(send_startup_alert())
     asyncio.create_task(set_menu_suggestions())
 
-    # 4. Pyrogram idle runner (deadlock and task destroyed fix)
+    # 4. Pyrogram idle runner
     await idle()
     await app.stop()
 
