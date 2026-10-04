@@ -3,7 +3,7 @@ import json
 import asyncio
 from aiohttp import web
 from groq import AsyncGroq
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import (
     Message,
@@ -51,32 +51,35 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
         return False
 
 
-async def generate_exam_ca_quiz(category: str) -> dict:
-    """Groq Llama-3.1-8b-instant se MCQ quiz generate karna."""
+async def generate_universal_quiz(user_topic: str) -> dict:
+    """UPSC, SSC, BPSC, Banking, State PCS ya kisi bhi subject ka factual MCQ generate karna."""
     prompt = f"""
-    Create 1 high-yield, factual Multiple Choice Question (MCQ) for competitive exams (UPSC/SSC/State PCS/Banking).
-    Target Topic/Domain: {category}.
-    Focus: Recent events, government schemes, summits, military exercises, indices, appointments, economy, or sports.
-    Language: Bilingual/Hinglish.
+    You are an expert exam setter for Indian competitive exams (UPSC, SSC CGL/CHSL, BPSC, State PCS, Banking, Railway, etc.).
 
-    Rules:
-    - 4 realistic and distinct options.
-    - Provide an informative 1-2 line factual explanation.
-    - Strictly return RAW JSON ONLY matching the schema.
+    Target Topic / Subject / Exam: "{user_topic}"
 
-    JSON Schema:
+    Instructions:
+    1. Create exactly 1 high-quality, authentic Multiple Choice Question (MCQ) strictly matching the requested topic/exam syllabus.
+    2. If the user mentions a specific exam (e.g. BPSC, UPSC, SSC), strictly match that exam's difficulty and standard.
+    3. If the topic is static (History, Polity, Geography, Science, Math, Reasoning, Bihar Special), frame a concept-based or factually accurate question.
+    4. If the topic is Current Affairs, focus on real verified developments, schemes, indices, or appointments.
+    5. Language: Bilingual/Hinglish (Hindi + English key terms) for easy comprehension by aspirants.
+    6. Provide 4 distinct options and 1 concise factual explanation.
+    7. Return RAW JSON ONLY without any markdown backticks.
+
+    Required JSON Schema:
     {{
-      "question": "Question statement here",
+      "question": "Question text here (Bilingual/Hinglish)",
       "options": ["Option A", "Option B", "Option C", "Option D"],
       "correct_option_id": 0,
-      "explanation": "Key factual detail for exam revision"
+      "explanation": "Clear 1-2 line explanation highlighting the core fact"
     }}
     """
 
     chat_completion = await groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="llama-3.1-8b-instant",
-        temperature=0.2,
+        model="llama3-8b-8192",
+        temperature=0.3,
         response_format={"type": "json_object"}
     )
 
@@ -84,7 +87,7 @@ async def generate_exam_ca_quiz(category: str) -> dict:
     return json.loads(content)
 
 
-# ==================== DUMMY WEB SERVER (RENDER PORT BIND) ====================
+# ==================== DUMMY WEB SERVER (RENDER PORT BIND FIX) ====================
 
 async def handle_ping(request):
     return web.Response(text="Bot is running active 24/7!")
@@ -97,18 +100,21 @@ async def start_dummy_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Dummy web server listening on port {port}")
+    print(f"🌐 Dummy web server listening on port {port} (Render Port Scan Resolved)")
 
 
 # ==================== COMMAND HANDLERS ====================
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
-    print(f"🔔 Received /start from User {message.from_user.id}")
     text = (
-        "👋 **Namaste! Main Competition Current Affairs Quiz Bot hoon.**\n\n"
-        "🎯 Yahan UPSC, SSC, Banking aur State Exams ke liye daily latest current affairs aur GS practice kar sakte hain.\n\n"
-        "⚙️ Commands dekhne ke liye **/help** dabayein."
+        "👋 **Namaste! Main Universal Competition Quiz Bot hoon.**\n\n"
+        "🎯 Aap kisi bhi exam ya subject ka quiz run kar sakte hain:\n"
+        "• **UPSC / State PCS / BPSC** (History, Polity, Bihar Special, Economy)\n"
+        "• **SSC CGL / CHSL** (GK, GS, Science, Reasoning, Math)\n"
+        "• **Railway / Banking / Defence**\n"
+        "• **Daily Current Affairs**\n\n"
+        "📖 Commands sikhne ke liye **/help** dabayein."
     )
     buttons = InlineKeyboardMarkup([
         [
@@ -121,23 +127,25 @@ async def start_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("help"))
 async def help_handler(client: Client, message: Message):
-    print(f"🔔 Received /help from User {message.from_user.id}")
     help_text = (
-        "📚 **Bot Command Guide:**\n\n"
-        "🔹 `/ca` - Latest General Current Affairs question send karega.\n"
-        "🔹 `/ca <topic>` - Specific topic par question generate karega.\n"
-        "   _Example: `/ca Schemes`, `/ca Defence`, `/ca Sports`_\n"
-        "🔹 `/settings` - Quiz Timer settings badalne ke liye.\n"
-        "🔹 `/setgroup` - Is group ko authorized list me lock karein (Owner only).\n"
-        "🔹 `/id` - Chat ID aur User ID dekhne ke liye.\n"
-        "🔹 `/help` - Is help menu ko dekhne ke liye."
+        "📚 **Quiz Command Guide (Kisi bhi syllabus par question banayein):**\n\n"
+        "🔹 `/ca` - Mixed GS & Latest Current Affairs\n"
+        "🔹 `/ca <exam ya topic>` - Specific exam ya syllabus ka question:\n"
+        "   • `/ca bpsc bihar special history`\n"
+        "   • `/ca upsc polity preamble`\n"
+        "   • `/ca ssc cgl ancient history`\n"
+        "   • `/ca railway general science chemistry`\n"
+        "   • `/ca economics banking repo rate`\n"
+        "   • `/ca sports current affairs`\n\n"
+        "🔹 `/settings` - Quiz Timer customize karein (15s, 30s, 45s, 60s)\n"
+        "🔹 `/setgroup` - Group ko authorize karein (Owner only)\n"
+        "🔹 `/id` - Chat ID aur User ID check karein"
     )
     await message.reply_text(help_text)
 
 
 @app.on_message(filters.command("id"))
 async def id_handler(client: Client, message: Message):
-    print(f"🔔 Received /id from Chat {message.chat.id}")
     await message.reply_text(
         f"📌 **Chat ID:** `{message.chat.id}`\n"
         f"👤 **User ID:** `{message.from_user.id}`"
@@ -146,12 +154,11 @@ async def id_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("settings"))
 async def settings_handler(client: Client, message: Message):
-    print(f"🔔 Received /settings from User {message.from_user.id}")
     if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Yeh command sirf Owner use kar sakta hai!**")
         return
 
-    text = f"⚙️ **Quiz Settings:**\n\n⏱️️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
+    text = f"⚙️ **Quiz Settings:**\n\n⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("15s", callback_data="set_time_15"),
@@ -165,7 +172,6 @@ async def settings_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("setgroup") & filters.group)
 async def setgroup_handler(client: Client, message: Message):
-    print(f"🔔 Received /setgroup in Chat {message.chat.id}")
     if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Sirf Owner hi group set kar sakta hai!**")
         return
@@ -182,32 +188,27 @@ async def setgroup_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("ca"))
 async def exam_quiz_handler(client: Client, message: Message):
-    print(f"🔔 Received /ca in Chat {message.chat.id} from User {message.from_user.id}")
-
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
-        print(f"🚫 Chat {message.chat.id} not in allowed list: {ALLOWED_CHAT_IDS}")
         return
 
-    owner_status = await is_owner(client, message.chat.id, message.from_user.id)
-    print(f"👤 User {message.from_user.id} Owner Status: {owner_status}")
-
-    if not owner_status:
+    if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Yeh command sirf Group Owner ke liye reserved hai!**")
         return
 
-    category = "Government Schemes, Summits, Defense and Economy"
     if len(message.command) > 1:
-        category = " ".join(message.command[1:])
+        topic = " ".join(message.command[1:])
+    else:
+        topic = "Mix GS and Recent Current Affairs for UPSC/SSC/BPSC"
 
-    status_msg = await message.reply_text(f"🎯 **[Owner Initiated]** `{category}` par question taiyar ho raha hai...")
+    status_msg = await message.reply_text(f"🎯 **[Quiz Generator]** `{topic}` par question taiyar ho raha hai...")
 
     try:
-        data = await generate_exam_ca_quiz(category)
+        data = await generate_universal_quiz(topic)
         options = data["options"][:4]
 
         await client.send_poll(
             chat_id=message.chat.id,
-            question=f"⏱ [Timer: {TIMER_SECONDS}s]\n" + data["question"],
+            question=f"⏱ [{TIMER_SECONDS}s] Topic: {topic}\n\n" + data["question"],
             options=options,
             is_anonymous=False,
             type="quiz",
@@ -218,7 +219,7 @@ async def exam_quiz_handler(client: Client, message: Message):
         await status_msg.delete()
 
     except Exception as e:
-        print(f"❌ Error during quiz dispatch: {e}")
+        print(f"❌ Error generating quiz: {e}")
         await status_msg.edit_text(f"❌ Error: Question generate nahi ho saka.\n`{e}`")
 
 
@@ -231,7 +232,12 @@ async def callback_handler(client: Client, query: CallbackQuery):
 
     if data == "btn_help":
         await query.answer()
-        await query.message.reply_text("🔹 `/ca` - Latest CA Question\n🔹 `/settings` - Timer Badalne Ke Liye")
+        help_text = (
+            "🔹 `/ca <topic>` - Kisi bhi subject/exam par question banayein\n"
+            "🔹 `/settings` - Quiz Timer badalein\n"
+            "🔹 `/id` - Chat ID check karein"
+        )
+        await query.message.reply_text(help_text)
 
     elif data == "btn_settings":
         await query.answer()
@@ -263,30 +269,30 @@ async def callback_handler(client: Client, query: CallbackQuery):
 # ==================== STARTUP NOTIFICATIONS & RUNNER ====================
 
 async def send_startup_alert():
-    """Bot live hote hi Admin/Group me alert message send karta hai."""
+    """Bot live hote hi Admin/Group me notification send karein."""
     target_id = LOG_GROUP_ID if LOG_GROUP_ID else OWNER_ID
     if target_id:
         try:
             bot_info = await app.get_me()
             alert_text = (
-                "🚀 **Bot Started Successfully!**\n\n"
+                "🚀 **Universal Quiz Bot Started Successfully!**\n\n"
                 f"🤖 **Bot:** @{bot_info.username}\n"
                 f"⏱️ **Default Timer:** `{TIMER_SECONDS}s`\n"
-                f"🔒 **Locked Groups:** `{len(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else 'All Allowed'}`\n"
+                f"🎯 **Support:** UPSC, SSC, BPSC, State PCS & All Subjects\n"
                 f"⚡ **Status:** Active & Ready for Quiz!"
             )
             await app.send_message(chat_id=target_id, text=alert_text)
             print(f"✅ Startup alert sent to ID: {target_id}")
         except Exception as e:
-            print(f"⚠️ Startup alert send nahi ho saka: {e}")
+            print(f"⚠️ Startup alert error: {e}")
 
 
 async def set_menu_suggestions():
-    """Bot connect hone ke baad Telegram command suggestions set karta hai."""
+    """Telegram menu bar suggestions configure karna."""
     await asyncio.sleep(2)
     try:
         commands = [
-            BotCommand("ca", "Start Current Affairs Quiz (Owner Only)"),
+            BotCommand("ca", "Run Quiz on any exam/syllabus topic"),
             BotCommand("settings", "Configure Quiz Timer & Settings"),
             BotCommand("setgroup", "Authorize this group for quizzes"),
             BotCommand("id", "Get Group and User IDs"),
@@ -299,27 +305,27 @@ async def set_menu_suggestions():
         print(f"⚠️ Suggestions set warning: {e}")
 
 
-async def run_bot():
-    # 1. Background web server bind (Render port check fix)
+async def main():
+    # 1. Dummy Web Server start
     await start_dummy_server()
 
-    # 2. Pyrogram client start
+    # 2. Pyrogram start
     print("🚀 Connecting Pyrogram Client to Telegram...")
     await app.start()
     print("✅ Pyrogram Client Connected & Listening for Messages!")
 
-    # 3. Startup alert aur menu suggestions trigger karein
+    # 3. Startup Alert aur Menu Suggestions trigger
     asyncio.create_task(send_startup_alert())
     asyncio.create_task(set_menu_suggestions())
 
-    # 4. Keep alive loop (Updates listen karne ke liye)
-    while True:
-        await asyncio.sleep(3600)
+    # 4. Pyrogram idle runner (deadlock and task destroyed fix)
+    await idle()
+    await app.stop()
 
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(run_bot())
+        loop.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
-        loop.run_until_complete(app.stop())
+        pass
