@@ -49,7 +49,7 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
 
 
 async def generate_exam_ca_quiz(category: str) -> dict:
-    """Groq Llama-3.3-70b se MCQ generate karna (Fast, JSON Mode)."""
+    """Groq Llama-3.3-8b se MCQ generate karna (Fast, JSON Mode)."""
     prompt = f"""
     Create 1 high-yield, factual Multiple Choice Question (MCQ) for competitive exams (UPSC/SSC/State PCS/Banking).
     Target Topic/Domain: {category}.
@@ -72,7 +72,7 @@ async def generate_exam_ca_quiz(category: str) -> dict:
 
     chat_completion = await groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-70b-versatile",
+        model="llama-3.3-8b-versatile",
         temperature=0.2,
         response_format={"type": "json_object"}
     )
