@@ -1,8 +1,9 @@
 import os
 import json
 import asyncio
+from aiohttp import web
 from groq import AsyncGroq
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import (
     Message,
@@ -38,7 +39,6 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 
 async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
-    """Check owner status (Global Bot Owner or Group Creator)."""
     if OWNER_ID and user_id == OWNER_ID:
         return True
     try:
@@ -49,17 +49,16 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
 
 
 async def generate_exam_ca_quiz(category: str) -> dict:
-    """Groq Llama-3.3-8b se MCQ generate karna (Fast, JSON Mode)."""
     prompt = f"""
     Create 1 high-yield, factual Multiple Choice Question (MCQ) for competitive exams (UPSC/SSC/State PCS/Banking).
     Target Topic/Domain: {category}.
-    Focus: Recent government schemes, summits, military exercises, indices, appointments, economy, or sports.
+    Focus: Recent events, government schemes, summits, military exercises, indices, appointments, or sports.
     Language: Bilingual/Hinglish.
 
     Rules:
     - 4 realistic and distinct options.
-    - Provide an informative 1-2 line factual explanation.
-    - Strictly return raw JSON matching the schema below without markdown backticks.
+    - Provide an informative 1-2 line explanation.
+    - Return RAW JSON ONLY.
 
     JSON Schema:
     {{
@@ -72,7 +71,7 @@ async def generate_exam_ca_quiz(category: str) -> dict:
 
     chat_completion = await groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-8b-versatile",
+        model="llama-3.1-8b-instant",
         temperature=0.2,
         response_format={"type": "json_object"}
     )
@@ -88,7 +87,7 @@ async def start_handler(client: Client, message: Message):
     text = (
         "👋 **Namaste! Main Competition Current Affairs Quiz Bot hoon.**\n\n"
         "🎯 Yahan UPSC, SSC, Banking aur State Exams ke liye daily latest current affairs aur GS practice kar sakte hain.\n\n"
-        "⚙️ Commands dekhne ke liye **/help** dabayein ya neeche button par click karein."
+        "⚙️ Commands dekhne ke liye **/help** dabayein."
     )
     buttons = InlineKeyboardMarkup([
         [
@@ -105,11 +104,9 @@ async def help_handler(client: Client, message: Message):
         "📚 **Bot Command Guide:**\n\n"
         "🔹 `/ca` - Latest General Current Affairs question send karega.\n"
         "🔹 `/ca <topic>` - Specific topic par question generate karega.\n"
-        "   _Example: `/ca Schemes`, `/ca Defence`, `/ca Sports`_\n"
         "🔹 `/settings` - Quiz Timer settings badalne ke liye.\n"
         "🔹 `/setgroup` - Is group ko authorized group list me set karein (Owner only).\n"
-        "🔹 `/help` - Is help menu ko dekhne ke liye.\n\n"
-        "⚠️️ _Note: Quiz trigger karne aur settings badalne ki permission sirf Owner ke paas hai._"
+        "🔹 `/help` - Is help menu ko dekhne ke liye."
     )
     await message.reply_text(help_text)
 
@@ -120,12 +117,7 @@ async def settings_handler(client: Client, message: Message):
         await message.reply_text("⛔ **Yeh command sirf Owner use kar sakta hai!**")
         return
 
-    text = (
-        f"⚙️ **Quiz Settings:**\n\n"
-        f"⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\n"
-        f"👥 **Group Lock Status:** {'Active' if ALLOWED_CHAT_IDS else 'All Groups Allowed'}\n\n"
-        f"Naya timer choose karne ke liye neeche click karein:"
-    )
+    text = f"⚙️ **Quiz Settings:**\n\n⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("15s", callback_data="set_time_15"),
@@ -149,18 +141,15 @@ async def setgroup_handler(client: Client, message: Message):
     await message.reply_text(
         f"✅ **Group Authorized Successfully!**\n\n"
         f"📌 **Group:** {message.chat.title}\n"
-        f"🆔 **Chat ID:** `{message.chat.id}`\n\n"
-        f"_Ab is group me quiz successfully chalega._"
+        f"🆔 **Chat ID:** `{message.chat.id}`"
     )
 
 
 @app.on_message(filters.command("ca") & filters.group)
 async def exam_quiz_handler(client: Client, message: Message):
-    # 1. Allowed Group Restriction
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
         return
 
-    # 2. Strict Owner Check
     if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Yeh command sirf Group Owner ke liye reserved hai!**")
         return
@@ -191,8 +180,6 @@ async def exam_quiz_handler(client: Client, message: Message):
         await status_msg.edit_text(f"❌ Error: Question generate nahi ho saka.\n`{e}`")
 
 
-# ==================== CALLBACK BUTTON HANDLERS ====================
-
 @app.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
     global TIMER_SECONDS
@@ -200,14 +187,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
 
     if data == "btn_help":
         await query.answer()
-        help_text = (
-            "📚 **Bot Command Guide:**\n\n"
-            "🔹 `/ca` - Latest Current Affairs Question\n"
-            "🔹 `/ca <topic>` - Specific Topic CA Question\n"
-            "🔹 `/settings` - Timer Badalne Ke Liye\n"
-            "🔹 `/setgroup` - Group Lock Set Karne Ke Liye"
-        )
-        await query.message.reply_text(help_text)
+        await query.message.reply_text("🔹 `/ca` - Latest CA Question\n🔹 `/settings` - Timer Badalne Ke Liye")
 
     elif data == "btn_settings":
         await query.answer()
@@ -233,14 +213,37 @@ async def callback_handler(client: Client, query: CallbackQuery):
         new_time = int(data.split("_")[2])
         TIMER_SECONDS = new_time
         await query.answer(f"✅ Timer {new_time}s par set ho gaya!", show_alert=True)
-        await query.message.edit_text(f"✅ **Timer successfully updated:** `{TIMER_SECONDS}` Seconds")
+        await query.message.edit_text(f"✅ **Timer updated:** `{TIMER_SECONDS}` Seconds")
 
 
-# ==================== BOT RUNNER ====================
+# ==================== WEB SERVER (RENDER PORT BIND) ====================
 
-async def set_menu_commands():
-    """Bot start hone ke 2 second baad Telegram menu suggestions update karta hai."""
-    await asyncio.sleep(2)
+async def handle_ping(request):
+    return web.Response(text="Bot is running active!")
+
+async def start_web_server():
+    """Render ke port scan error ko khatam karne ke liye simple web server."""
+    port = int(os.environ.get("PORT", 8080))
+    server = web.Application()
+    server.router.add_get("/", handle_ping)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"✅ Web server listening on port {port} (Render Port Bind Done)")
+
+
+# ==================== MAIN STARTUP ====================
+
+async def main():
+    # 1. Pehle dummy web server chalu karein taaki Render port detect kar le
+    await start_web_server()
+
+    # 2. Pyrogram client start karein
+    print("Owner CA Quiz Bot start ho raha hai...")
+    await app.start()
+
+    # 3. Client start hone ke BAAD menu commands set karein
     try:
         commands = [
             BotCommand("ca", "Start Current Affairs Quiz (Owner Only)"),
@@ -252,10 +255,14 @@ async def set_menu_commands():
         await app.set_bot_commands(commands)
         print("✅ Telegram Command Menu Suggestions successfully set!")
     except Exception as e:
-        print(f"⚠️️ Command menu set error: {e}")
+        print(f"⚠️ Command menu set warning: {e}")
+
+    # 4. Bot ko continuously run rakhein
+    await idle()
+    await app.stop()
 
 
 if __name__ == "__main__":
-    print("Owner CA Quiz Bot start ho raha hai...")
-    app.loop.create_task(set_menu_commands())
-    app.run()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main())
