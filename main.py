@@ -67,7 +67,7 @@ def generate_exam_ca_quiz(category: str) -> dict:
     """
 
     response = ai_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
