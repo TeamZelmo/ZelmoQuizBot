@@ -39,6 +39,37 @@ GROQ_MODELS = [
 raw_chats = os.getenv("ALLOWED_CHAT_IDS", "")
 ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in raw_chats.split(",") if cid.strip()]
 
+# स्थायी अनुमति: env में कॉमा से अलग उपयोगकर्ता आईडी, जैसे ALLOWED_USER_IDS="123,456" (सभी समूहों में मान्य)
+raw_users = os.getenv("ALLOWED_USER_IDS", "")
+GLOBAL_ALLOWED_USERS = {int(x.strip()) for x in raw_users.split(",") if x.strip().lstrip("-").isdigit()}
+
+# /allow से दी गई अनुमति: chat_id -> उपयोगकर्ता आईडी का समूह (फ़ाइल में सहेजी जाती है)
+AUTH_FILE = "auth_users.json"
+AUTH_USERS = {}
+
+
+def load_auth():
+    try:
+        if os.path.exists(AUTH_FILE):
+            with open(AUTH_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for cid, ids in data.items():
+                AUTH_USERS[int(cid)] = {int(x) for x in ids}
+            print(f"✅ अनुमति सूची लोड हुई: {sum(len(v) for v in AUTH_USERS.values())} उपयोगकर्ता")
+    except Exception as e:
+        print(f"⚠️ अनुमति सूची लोड नहीं हो सकी: {e}")
+
+
+def save_auth():
+    try:
+        with open(AUTH_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(c): sorted(ids) for c, ids in AUTH_USERS.items()}, f)
+    except Exception as e:
+        print(f"⚠️ अनुमति सूची सहेजी नहीं जा सकी: {e}")
+
+
+load_auth()
+
 app = Client(
     "competition_ca_bot",
     api_id=API_ID,
@@ -63,6 +94,32 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
     except Exception as e:
         print(f"⚠️ स्वामी की जाँच में त्रुटि: {e}")
         return False
+
+
+async def can_run_quiz(client: Client, chat_id: int, user_id: int) -> bool:
+    """स्वामी, या जिसे अनुमति दी गई हो, वही प्रश्नोत्तरी चला सकता है।"""
+    if user_id in GLOBAL_ALLOWED_USERS:
+        return True
+    if user_id in AUTH_USERS.get(chat_id, set()):
+        return True
+    return await is_owner(client, chat_id, user_id)
+
+
+async def resolve_target(client: Client, message: Message):
+    """उत्तर (reply) वाले संदेश, संख्या-आईडी या @username से उपयोगकर्ता पहचानना।"""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        return u.id, clean(u.first_name or "") or str(u.id)
+
+    if len(message.command) > 1:
+        arg = message.command[1].strip()
+        try:
+            u = await client.get_users(int(arg) if arg.lstrip("-").isdigit() else arg)
+            return u.id, clean(u.first_name or "") or str(u.id)
+        except Exception:
+            if arg.isdigit():
+                return int(arg), arg
+    return None, None
 
 
 def clean(text: str) -> str:
@@ -435,7 +492,10 @@ async def help_handler(client: Client, message: Message):
         "   • `/ca 15 सामान्य विज्ञान`\n"
         "   • `/ca` — 1 प्रश्न (मिश्रित सामान्य ज्ञान)\n\n"
         "🔹 `/score` — चल रही प्रश्नोत्तरी की अब तक की परिणाम तालिका\n"
-        "🔹 `/stopquiz` — चल रही प्रश्नोत्तरी रोकें (केवल स्वामी)\n"
+        "🔹 `/stopquiz` — चल रही प्रश्नोत्तरी रोकें (स्वामी / अनुमति प्राप्त)\n"
+        "🔹 `/allow` — किसी को प्रश्नोत्तरी चलाने की अनुमति दें (केवल स्वामी; उसके संदेश पर reply करके लिखें)\n"
+        "🔹 `/disallow` — अनुमति हटाएँ (केवल स्वामी)\n"
+        "🔹 `/allowed` — अनुमति प्राप्त लोगों की सूची\n"
         "🔹 `/settings` — समय-सीमा बदलें\n"
         "🔹 `/setgroup` — समूह को अधिकृत करें (केवल स्वामी)\n"
         "🔹 `/id` — चैट और उपयोगकर्ता की पहचान संख्या"
@@ -490,8 +550,11 @@ async def exam_quiz_handler(client: Client, message: Message):
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
         return
 
-    if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ **यह आदेश केवल समूह स्वामी के लिए सुरक्षित है!**")
+    if not await can_run_quiz(client, message.chat.id, message.from_user.id):
+        await message.reply_text(
+            "⛔ **आपको प्रश्नोत्तरी चलाने की अनुमति नहीं है!**\n"
+            "समूह स्वामी से अनुमति (`/allow`) लेने को कहें।"
+        )
         return
 
     chat_id = message.chat.id
@@ -525,12 +588,86 @@ async def exam_quiz_handler(client: Client, message: Message):
     SESSIONS[chat_id]["task"] = asyncio.create_task(run_quiz(client, chat_id, topic, total))
 
 
+@app.on_message(filters.command("allow") & filters.group)
+async def allow_handler(client: Client, message: Message):
+    if not message.from_user:
+        return
+    if not await is_owner(client, message.chat.id, message.from_user.id):
+        await message.reply_text("⛔ **केवल स्वामी ही अनुमति दे सकता है!**")
+        return
+
+    uid, name = await resolve_target(client, message)
+    if uid is None:
+        await message.reply_text(
+            "ℹ️ **उपयोग:**\n"
+            "• जिसे अनुमति देनी है उसके संदेश पर उत्तर (reply) देकर `/allow` लिखें\n"
+            "• या `/allow 123456789` (उपयोगकर्ता आईडी)\n"
+            "• या `/allow @username`"
+        )
+        return
+
+    AUTH_USERS.setdefault(message.chat.id, set()).add(uid)
+    save_auth()
+    await message.reply_text(
+        f"✅ **{name}** (`{uid}`) को इस समूह में प्रश्नोत्तरी चलाने की अनुमति दे दी गई।"
+    )
+
+
+@app.on_message(filters.command("disallow") & filters.group)
+async def disallow_handler(client: Client, message: Message):
+    if not message.from_user:
+        return
+    if not await is_owner(client, message.chat.id, message.from_user.id):
+        await message.reply_text("⛔ **केवल स्वामी ही अनुमति हटा सकता है!**")
+        return
+
+    uid, name = await resolve_target(client, message)
+    if uid is None:
+        await message.reply_text(
+            "ℹ️ जिसकी अनुमति हटानी है उसके संदेश पर उत्तर (reply) देकर `/disallow` लिखें, "
+            "या `/disallow 123456789` लिखें।"
+        )
+        return
+
+    users = AUTH_USERS.get(message.chat.id, set())
+    if uid in users:
+        users.discard(uid)
+        save_auth()
+        await message.reply_text(f"✅ **{name}** (`{uid}`) की अनुमति हटा दी गई।")
+    else:
+        await message.reply_text(f"ℹ️ **{name}** (`{uid}`) को पहले से अनुमति प्राप्त नहीं थी।")
+
+
+@app.on_message(filters.command("allowed") & filters.group)
+async def allowed_list_handler(client: Client, message: Message):
+    if not message.from_user:
+        return
+    if not await can_run_quiz(client, message.chat.id, message.from_user.id):
+        await message.reply_text("⛔ यह आदेश केवल अनुमति प्राप्त उपयोगकर्ता चला सकते हैं।")
+        return
+
+    ids = sorted(AUTH_USERS.get(message.chat.id, set()))
+    if not ids:
+        await message.reply_text("ℹ️ अभी किसी अन्य उपयोगकर्ता को अनुमति नहीं दी गई है। (स्वामी हमेशा चला सकता है)")
+        return
+
+    lines = ["👥 **प्रश्नोत्तरी चलाने की अनुमति प्राप्त उपयोगकर्ता:**\n"]
+    for n, uid in enumerate(ids, 1):
+        try:
+            u = await client.get_users(uid)
+            label = clean(u.first_name or "") or str(uid)
+        except Exception:
+            label = "नाम उपलब्ध नहीं"
+        lines.append(f"{n}. {label} — `{uid}`")
+    await message.reply_text("\n".join(lines))
+
+
 @app.on_message(filters.command("stopquiz"))
 async def stop_handler(client: Client, message: Message):
     if not message.from_user:
         return
-    if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ केवल स्वामी ही प्रश्नोत्तरी रोक सकता है!")
+    if not await can_run_quiz(client, message.chat.id, message.from_user.id):
+        await message.reply_text("⛔ आपको प्रश्नोत्तरी रोकने की अनुमति नहीं है!")
         return
 
     session = SESSIONS.get(message.chat.id)
@@ -634,6 +771,9 @@ async def set_menu_suggestions():
             BotCommand("ca", "प्रश्नोत्तरी चलाएँ: /ca 10 विषय"),
             BotCommand("score", "अब तक का परिणाम देखें"),
             BotCommand("stopquiz", "चल रही प्रश्नोत्तरी रोकें"),
+            BotCommand("allow", "किसी को प्रश्नोत्तरी की अनुमति दें"),
+            BotCommand("disallow", "किसी की अनुमति हटाएँ"),
+            BotCommand("allowed", "अनुमति प्राप्त उपयोगकर्ताओं की सूची"),
             BotCommand("settings", "समय-सीमा की व्यवस्था"),
             BotCommand("setgroup", "समूह को अधिकृत करें"),
             BotCommand("id", "चैट और उपयोगकर्ता आईडी"),
