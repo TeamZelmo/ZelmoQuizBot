@@ -3,7 +3,7 @@ import json
 import asyncio
 from aiohttp import web
 from groq import AsyncGroq
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import (
     Message,
@@ -21,6 +21,7 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+LOG_GROUP_ID = int(os.getenv("LOG_GROUP_ID", "0"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 TIMER_SECONDS = int(os.getenv("TIMER_SECONDS", "30"))
@@ -61,7 +62,7 @@ async def generate_exam_ca_quiz(category: str) -> dict:
     Rules:
     - 4 realistic and distinct options.
     - Provide an informative 1-2 line factual explanation.
-    - Return RAW JSON ONLY matching the schema.
+    - Strictly return RAW JSON ONLY matching the schema.
 
     JSON Schema:
     {{
@@ -83,11 +84,27 @@ async def generate_exam_ca_quiz(category: str) -> dict:
     return json.loads(content)
 
 
+# ==================== DUMMY WEB SERVER (RENDER PORT BIND) ====================
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running active 24/7!")
+
+async def start_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = web.Application()
+    server.router.add_get("/", handle_ping)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Dummy web server listening on port {port}")
+
+
 # ==================== COMMAND HANDLERS ====================
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
-    print(f"📥 /start received from user: {message.from_user.id}")
+    print(f"🔔 Received /start from User {message.from_user.id}")
     text = (
         "👋 **Namaste! Main Competition Current Affairs Quiz Bot hoon.**\n\n"
         "🎯 Yahan UPSC, SSC, Banking aur State Exams ke liye daily latest current affairs aur GS practice kar sakte hain.\n\n"
@@ -104,7 +121,7 @@ async def start_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("help"))
 async def help_handler(client: Client, message: Message):
-    print(f"📥 /help received from user: {message.from_user.id}")
+    print(f"🔔 Received /help from User {message.from_user.id}")
     help_text = (
         "📚 **Bot Command Guide:**\n\n"
         "🔹 `/ca` - Latest General Current Affairs question send karega.\n"
@@ -113,14 +130,14 @@ async def help_handler(client: Client, message: Message):
         "🔹 `/settings` - Quiz Timer settings badalne ke liye.\n"
         "🔹 `/setgroup` - Is group ko authorized list me lock karein (Owner only).\n"
         "🔹 `/id` - Chat ID aur User ID dekhne ke liye.\n"
-        "🔹 `/help` - Is help menu ko dekhne ke liye.\n\n"
-        "⚠️ _Note: Quiz start karne aur settings badalne ki permission sirf Owner ke paas hai._"
+        "🔹 `/help` - Is help menu ko dekhne ke liye."
     )
     await message.reply_text(help_text)
 
 
 @app.on_message(filters.command("id"))
 async def id_handler(client: Client, message: Message):
+    print(f"🔔 Received /id from Chat {message.chat.id}")
     await message.reply_text(
         f"📌 **Chat ID:** `{message.chat.id}`\n"
         f"👤 **User ID:** `{message.from_user.id}`"
@@ -129,12 +146,12 @@ async def id_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("settings"))
 async def settings_handler(client: Client, message: Message):
-    print(f"📥 /settings received from user: {message.from_user.id}")
+    print(f"🔔 Received /settings from User {message.from_user.id}")
     if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Yeh command sirf Owner use kar sakta hai!**")
         return
 
-    text = f"⚙️ **Quiz Settings:**\n\n⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
+    text = f"⚙️ **Quiz Settings:**\n\n⏱️️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("15s", callback_data="set_time_15"),
@@ -148,7 +165,7 @@ async def settings_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("setgroup") & filters.group)
 async def setgroup_handler(client: Client, message: Message):
-    print(f"📥 /setgroup in chat: {message.chat.id} by: {message.from_user.id}")
+    print(f"🔔 Received /setgroup in Chat {message.chat.id}")
     if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Sirf Owner hi group set kar sakta hai!**")
         return
@@ -165,18 +182,16 @@ async def setgroup_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("ca"))
 async def exam_quiz_handler(client: Client, message: Message):
-    print(f"📥 /ca received in Chat: {message.chat.id} from User: {message.from_user.id}")
+    print(f"🔔 Received /ca in Chat {message.chat.id} from User {message.from_user.id}")
 
-    # 1. Allowed Group Restriction
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
-        print(f"🚫 Chat {message.chat.id} not in ALLOWED_CHAT_IDS: {ALLOWED_CHAT_IDS}")
+        print(f"🚫 Chat {message.chat.id} not in allowed list: {ALLOWED_CHAT_IDS}")
         return
 
-    # 2. Strict Owner Check
-    owner_check = await is_owner(client, message.chat.id, message.from_user.id)
-    print(f"👤 User {message.from_user.id} Owner Status: {owner_check}")
+    owner_status = await is_owner(client, message.chat.id, message.from_user.id)
+    print(f"👤 User {message.from_user.id} Owner Status: {owner_status}")
 
-    if not owner_check:
+    if not owner_status:
         await message.reply_text("⛔ **Yeh command sirf Group Owner ke liye reserved hai!**")
         return
 
@@ -203,7 +218,7 @@ async def exam_quiz_handler(client: Client, message: Message):
         await status_msg.delete()
 
     except Exception as e:
-        print(f"❌ Error generating/sending quiz: {e}")
+        print(f"❌ Error during quiz dispatch: {e}")
         await status_msg.edit_text(f"❌ Error: Question generate nahi ho saka.\n`{e}`")
 
 
@@ -245,31 +260,30 @@ async def callback_handler(client: Client, query: CallbackQuery):
         await query.message.edit_text(f"✅ **Timer updated:** `{TIMER_SECONDS}` Seconds")
 
 
-# ==================== WEB SERVER (RENDER DUMMY PORT) ====================
+# ==================== STARTUP NOTIFICATIONS & RUNNER ====================
 
-async def handle_ping(request):
-    return web.Response(text="Bot is running active!")
+async def send_startup_alert():
+    """Bot live hote hi Admin/Group me alert message send karta hai."""
+    target_id = LOG_GROUP_ID if LOG_GROUP_ID else OWNER_ID
+    if target_id:
+        try:
+            bot_info = await app.get_me()
+            alert_text = (
+                "🚀 **Bot Started Successfully!**\n\n"
+                f"🤖 **Bot:** @{bot_info.username}\n"
+                f"⏱️ **Default Timer:** `{TIMER_SECONDS}s`\n"
+                f"🔒 **Locked Groups:** `{len(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else 'All Allowed'}`\n"
+                f"⚡ **Status:** Active & Ready for Quiz!"
+            )
+            await app.send_message(chat_id=target_id, text=alert_text)
+            print(f"✅ Startup alert sent to ID: {target_id}")
+        except Exception as e:
+            print(f"⚠️ Startup alert send nahi ho saka: {e}")
 
-async def start_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = web.Application()
-    server.router.add_get("/", handle_ping)
-    runner = web.AppRunner(server)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"✅ Web server listening on port {port} (Render Port Bind Successful)")
 
-
-# ==================== BOT RUNNER ====================
-
-async def main():
-    await start_web_server()
-
-    print("Owner CA Quiz Bot starting Pyrogram...")
-    await app.start()
-
-    # Commands list set karna
+async def set_menu_suggestions():
+    """Bot connect hone ke baad Telegram command suggestions set karta hai."""
+    await asyncio.sleep(2)
     try:
         commands = [
             BotCommand("ca", "Start Current Affairs Quiz (Owner Only)"),
@@ -280,15 +294,32 @@ async def main():
             BotCommand("start", "Start the bot interface")
         ]
         await app.set_bot_commands(commands)
-        print("✅ Telegram Command Menu Suggestions successfully set!")
+        print("✅ Telegram Command Menu Suggestions set successfully!")
     except Exception as e:
-        print(f"⚠️ Command menu set warning: {e}")
+        print(f"⚠️ Suggestions set warning: {e}")
 
-    await idle()
-    await app.stop()
+
+async def run_bot():
+    # 1. Background web server bind (Render port check fix)
+    await start_dummy_server()
+
+    # 2. Pyrogram client start
+    print("🚀 Connecting Pyrogram Client to Telegram...")
+    await app.start()
+    print("✅ Pyrogram Client Connected & Listening for Messages!")
+
+    # 3. Startup alert aur menu suggestions trigger karein
+    asyncio.create_task(send_startup_alert())
+    asyncio.create_task(set_menu_suggestions())
+
+    # 4. Keep alive loop (Updates listen karne ke liye)
+    while True:
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(run_bot())
+    except (KeyboardInterrupt, SystemExit):
+        loop.run_until_complete(app.stop())
