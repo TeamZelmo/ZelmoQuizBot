@@ -146,6 +146,7 @@ def record_vote(session: dict, q: dict, uid: int, name: str, chosen: int, elapse
         return
     is_right = (chosen == q["correct"])
     q["voted"][uid] = is_right
+    q.setdefault("times", {})[uid] = max(elapsed, 0.0)
 
     s = session["scores"].setdefault(uid, {"name": name, "correct": 0, "wrong": 0, "time": 0.0})
     if is_right:
@@ -251,9 +252,16 @@ def build_leaderboard(session: dict, finished: bool = True) -> str:
         right = counts[q["correct"]] if q["correct"] < len(counts) else 0
         if got:
             any_votes = True
-        summary_lines.append(
-            f"प्रश्न {q['no']}: कुल उत्तर `{got}` — ✅ सही `{right}`, ❌ गलत `{got - right}`"
-        )
+        line = f"प्रश्न {q['no']}: कुल उत्तर `{got}` — ✅ सही `{right}`, ❌ गलत `{got - right}`"
+
+        # इस प्रश्न का सबसे पहले सही उत्तर देने वाला
+        times = q.get("times", {})
+        correct_users = [(times.get(u, 9999), u) for u, ok in q["voted"].items() if ok]
+        if correct_users:
+            _, first_uid = min(correct_users)
+            first_name = session["scores"].get(first_uid, {}).get("name", f"उपयोगकर्ता {first_uid}")
+            line += f"\n    ⚡ सबसे पहले सही: {first_name}"
+        summary_lines.append(line)
     summary_block = ("\n\n📋 **प्रश्न-वार सारांश**\n" + "\n".join(summary_lines)) if summary_lines else ""
 
     if not scores:
@@ -283,6 +291,7 @@ def build_leaderboard(session: dict, finished: bool = True) -> str:
         label = rank_labels[i] if i < 3 else f"{i + 1}. स्थान"
         lines.append(
             f"{label} — **{s['name']}**\n"
+            f"    📝 उत्तर दिए: `{s['correct'] + s['wrong']}/{total}` प्रश्न\n"
             f"    ✅ सही: `{s['correct']}`   ❌ गलत: `{s['wrong']}`   ⏭ छोड़े गए: `{skipped}`\n"
             f"    ⏱ कुल समय: `{s['time']:.1f}` सेकंड"
         )
