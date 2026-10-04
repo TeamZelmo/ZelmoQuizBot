@@ -201,7 +201,7 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
 
 # ==================== VOTE TRACKING ====================
 
-@app.on_raw_update()
+@app.on_raw_update(group=-1)
 async def vote_tracker(client, update, users, chats):
     if not isinstance(update, raw.types.UpdateMessagePollVote):
         return
