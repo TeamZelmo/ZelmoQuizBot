@@ -51,6 +51,26 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
         return False
 
 
+async def get_active_groq_model() -> str:
+    """Groq API se live active models ki list check karke functional model select karna."""
+    preferred_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "gemma2-9b-it"
+    ]
+    try:
+        models_data = await groq_client.models.list()
+        active_ids = [m.id for m in models_data.data if getattr(m, "active", True)]
+        for pref in preferred_models:
+            if pref in active_ids:
+                return pref
+        if active_ids:
+            return active_ids[0]
+    except Exception as e:
+        print(f"⚠️ Groq live models fetch warning: {e}")
+    return "llama-3.3-70b-versatile"
+
+
 async def generate_universal_quiz(user_topic: str) -> dict:
     """UPSC, SSC, BPSC, Banking, State PCS ya kisi bhi syllabus ka factual MCQ generate karna."""
     prompt = f"""
@@ -76,30 +96,17 @@ async def generate_universal_quiz(user_topic: str) -> dict:
     }}
     """
 
-    # Active models fallback system
-    models_to_try = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "mixtral-8x7b-32768"
-    ]
+    model_name = await get_active_groq_model()
 
-    last_error = None
-    for model_name in models_to_try:
-        try:
-            chat_completion = await groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=model_name,
-                temperature=0.3,
-                response_format={"type": "json_object"}
-            )
-            content = chat_completion.choices[0].message.content.strip()
-            return json.loads(content)
-        except Exception as e:
-            print(f"⚠️ Model {model_name} failed: {e}. Trying next model...")
-            last_error = e
-            continue
+    chat_completion = await groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model=model_name,
+        temperature=0.3,
+        response_format={"type": "json_object"}
+    )
 
-    raise last_error
+    content = chat_completion.choices[0].message.content.strip()
+    return json.loads(content)
 
 
 # ==================== DUMMY WEB SERVER (RENDER PORT BIND FIX) ====================
@@ -115,7 +122,7 @@ async def start_dummy_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Dummy web server listening on port {port}")
+    print(f"🌐 Dummy web server listening on port {port} (Render Port Scan Resolved)")
 
 
 # ==================== COMMAND HANDLERS ====================
@@ -134,7 +141,7 @@ async def start_handler(client: Client, message: Message):
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📖 Help Guide", callback_data="btn_help"),
-            InlineKeyboardButton("⚙️️ Settings", callback_data="btn_settings")
+            InlineKeyboardButton("⚙️ Settings", callback_data="btn_settings")
         ]
     ])
     await message.reply_text(text, reply_markup=buttons)
@@ -173,7 +180,7 @@ async def settings_handler(client: Client, message: Message):
         await message.reply_text("⛔ **Yeh command sirf Owner use kar sakta hai!**")
         return
 
-    text = f"⚙️️ **Quiz Settings:**\n\n⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
+    text = f"⚙️ **Quiz Settings:**\n\n⏱️️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
     buttons = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("15s", callback_data="set_time_15"),
@@ -284,22 +291,25 @@ async def callback_handler(client: Client, query: CallbackQuery):
 # ==================== STARTUP NOTIFICATIONS & RUNNER ====================
 
 async def send_startup_alert():
-    """Bot live hote hi Admin/Group me notification send karein."""
+    """Bot live hote hi Admin/Group me notification send karta hai."""
     target_id = LOG_GROUP_ID if LOG_GROUP_ID else OWNER_ID
-    if target_id:
-        try:
-            bot_info = await app.get_me()
-            alert_text = (
-                "🚀 **Universal Quiz Bot Started Successfully!**\n\n"
-                f"🤖 **Bot:** @{bot_info.username}\n"
-                f"⏱️ **Default Timer:** `{TIMER_SECONDS}s`\n"
-                f"🎯 **Support:** UPSC, SSC, BPSC, State PCS & All Subjects\n"
-                f"⚡ **Status:** Active & Ready for Quiz!"
-            )
-            await app.send_message(chat_id=target_id, text=alert_text)
-            print(f"✅ Startup alert sent to ID: {target_id}")
-        except Exception as e:
-            print(f"⚠️ Startup alert error: {e}")
+    if not target_id:
+        print("⚠️ LOG_GROUP_ID aur OWNER_ID dono set nahi hain. Startup alert skip kiya gaya.")
+        return
+
+    try:
+        bot_info = await app.get_me()
+        alert_text = (
+            "🚀 **Universal Quiz Bot Started Successfully!**\n\n"
+            f"🤖 **Bot:** @{bot_info.username}\n"
+            f"⏱️ **Default Timer:** `{TIMER_SECONDS}s`\n"
+            f"🎯 **Support:** UPSC, SSC, BPSC, State PCS & All Subjects\n"
+            f"⚡ **Status:** Active & Ready for Quiz!"
+        )
+        await app.send_message(chat_id=target_id, text=alert_text)
+        print(f"✅ Startup alert successfully sent to target ID: {target_id}")
+    except Exception as e:
+        print(f"❌ Startup alert send karne me error aaya (Target ID: {target_id}): {e}")
 
 
 async def set_menu_suggestions():
@@ -321,19 +331,21 @@ async def set_menu_suggestions():
 
 
 async def main():
-    # 1. Dummy Web Server start (Render requirement)
+    # 1. Render dummy web server start
     await start_dummy_server()
 
-    # 2. Pyrogram start
+    # 2. Pyrogram bot connect
     print("🚀 Connecting Pyrogram Client to Telegram...")
     await app.start()
     print("✅ Pyrogram Client Connected & Listening for Messages!")
 
-    # 3. Startup Alert aur Menu Suggestions trigger
-    asyncio.create_task(send_startup_alert())
+    # 3. Direct await startup alert
+    await send_startup_alert()
+
+    # 4. Suggestions set karna background task me
     asyncio.create_task(set_menu_suggestions())
 
-    # 4. Pyrogram idle runner
+    # 5. Event loop ko idle me rakhna
     await idle()
     await app.stop()
 
