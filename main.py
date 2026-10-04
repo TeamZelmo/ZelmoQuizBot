@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-from g4f.client import AsyncClient
+from groq import AsyncGroq
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import (
@@ -20,6 +20,7 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 TIMER_SECONDS = int(os.getenv("TIMER_SECONDS", "30"))
 
@@ -33,7 +34,7 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-ai_client = AsyncClient()
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 
 async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
@@ -48,19 +49,19 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
 
 
 async def generate_exam_ca_quiz(category: str) -> dict:
-    """Generate competitive exam MCQ using G4F with web search."""
+    """Groq Llama-3.3-70b se MCQ generate karna (Fast, JSON Mode)."""
     prompt = f"""
     Create 1 high-yield, factual Multiple Choice Question (MCQ) for competitive exams (UPSC/SSC/State PCS/Banking).
     Target Topic/Domain: {category}.
-    Focus: Recent events, government schemes, summits, military exercises, indices, appointments, or sports.
+    Focus: Recent government schemes, summits, military exercises, indices, appointments, economy, or sports.
     Language: Bilingual/Hinglish.
 
     Rules:
     - 4 realistic and distinct options.
-    - Provide an informative 1-2 line explanation.
-    - Return RAW JSON ONLY. No markdown backticks, no text before or after the JSON.
+    - Provide an informative 1-2 line factual explanation.
+    - Strictly return raw JSON matching the schema below without markdown backticks.
 
-    Schema:
+    JSON Schema:
     {{
       "question": "Question statement here",
       "options": ["Option A", "Option B", "Option C", "Option D"],
@@ -69,21 +70,15 @@ async def generate_exam_ca_quiz(category: str) -> dict:
     }}
     """
 
-    response = await ai_client.chat.completions.create(
-        model="gpt-4o-mini",
+    chat_completion = await groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        web_search=True
+        model="llama-3.3-70b-versatile",
+        temperature=0.2,
+        response_format={"type": "json_object"}
     )
 
-    content = response.choices[0].message.content.strip()
-    clean_text = content.replace("```json", "").replace("```", "").strip()
-
-    start_idx = clean_text.find("{")
-    end_idx = clean_text.rfind("}") + 1
-    if start_idx != -1 and end_idx != -1:
-        clean_text = clean_text[start_idx:end_idx]
-
-    return json.loads(clean_text)
+    content = chat_completion.choices[0].message.content.strip()
+    return json.loads(content)
 
 
 # ==================== COMMAND HANDLERS ====================
@@ -114,7 +109,7 @@ async def help_handler(client: Client, message: Message):
         "🔹 `/settings` - Quiz Timer settings badalne ke liye.\n"
         "🔹 `/setgroup` - Is group ko authorized group list me set karein (Owner only).\n"
         "🔹 `/help` - Is help menu ko dekhne ke liye.\n\n"
-        "⚠️ _Note: Quiz trigger karne aur settings badalne ki permission sirf Owner ke paas hai._"
+        "⚠️️ _Note: Quiz trigger karne aur settings badalne ki permission sirf Owner ke paas hai._"
     )
     await message.reply_text(help_text)
 
@@ -182,7 +177,7 @@ async def exam_quiz_handler(client: Client, message: Message):
 
         await client.send_poll(
             chat_id=message.chat.id,
-            question=f"⏱️️ [Timer: {TIMER_SECONDS}s]\n" + data["question"],
+            question=f"⏱ [Timer: {TIMER_SECONDS}s]\n" + data["question"],
             options=options,
             is_anonymous=False,
             type="quiz",
@@ -244,7 +239,7 @@ async def callback_handler(client: Client, query: CallbackQuery):
 # ==================== BOT RUNNER ====================
 
 async def set_menu_commands():
-    """Bot start hone ke baad menu suggestions set karna."""
+    """Bot start hone ke 2 second baad Telegram menu suggestions update karta hai."""
     await asyncio.sleep(2)
     try:
         commands = [
@@ -255,13 +250,12 @@ async def set_menu_commands():
             BotCommand("start", "Start the bot interface")
         ]
         await app.set_bot_commands(commands)
-        print("✅ Telegram Command Menu Suggestions set ho gaye!")
+        print("✅ Telegram Command Menu Suggestions successfully set!")
     except Exception as e:
-        print(f"⚠️ Command menu set karne me error: {e}")
+        print(f"⚠️️ Command menu set error: {e}")
 
 
 if __name__ == "__main__":
     print("Owner CA Quiz Bot start ho raha hai...")
-    # Background task for command menu suggestions
     app.loop.create_task(set_menu_commands())
     app.run()
