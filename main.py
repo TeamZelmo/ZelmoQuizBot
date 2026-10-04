@@ -1,11 +1,12 @@
 import os
+import re
 import json
 import time
 import asyncio
 from aiohttp import web
 from groq import AsyncGroq
 from pyrogram import Client, filters, idle, raw
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.types import (
     Message,
     BotCommand,
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Config Variables ---
+# --- कॉन्फ़िग ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -28,8 +29,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TIMER_SECONDS = int(os.getenv("TIMER_SECONDS", "30"))
 MAX_QUESTIONS = 25
 
-# Comma-separated list in env, e.g. GROQ_MODELS="openai/gpt-oss-120b,openai/gpt-oss-20b"
-# (Groq models retire often; check https://console.groq.com/docs/models)
+# env में कॉमा से अलग किए नाम, जैसे GROQ_MODELS="openai/gpt-oss-120b,openai/gpt-oss-20b"
 GROQ_MODELS = [
     m.strip()
     for m in os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b").split(",")
@@ -48,9 +48,9 @@ app = Client(
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# chat_id -> session dict
+# chat_id -> सत्र (session)
 SESSIONS = {}
-# poll_id -> chat_id
+# poll_id (संख्या) -> chat_id
 POLL_TO_CHAT = {}
 
 
@@ -61,14 +61,29 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
         member = await client.get_chat_member(chat_id, user_id)
         return member.status == ChatMemberStatus.OWNER
     except Exception as e:
-        print(f"⚠️ Error checking owner status: {e}")
+        print(f"⚠️ स्वामी की जाँच में त्रुटि: {e}")
         return False
+
+
+def clean_name(name: str) -> str:
+    """मार्कडाउन तोड़ने वाले अक्षर हटाना।"""
+    return re.sub(r"[*_`\[\]~]", "", name).strip()
+
+
+async def safe_send(client: Client, chat_id: int, text: str):
+    """संदेश भेजना; फ़ॉर्मेटिंग में दिक्कत हो तो सादे रूप में भेजना।"""
+    try:
+        await client.send_message(chat_id, text)
+    except Exception as e:
+        print(f"⚠️ फ़ॉर्मेटेड संदेश नहीं गया, सादा भेज रहे हैं: {e}")
+        plain = text.replace("**", "").replace("`", "")
+        await client.send_message(chat_id, plain, parse_mode=ParseMode.DISABLED)
 
 
 async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
     avoid_text = ""
     if avoid:
-        avoid_text = "\n    Do NOT repeat these already-asked questions:\n    - " + "\n    - ".join(avoid[-15:])
+        avoid_text = "\n    ये प्रश्न पहले पूछे जा चुके हैं, इन्हें दोहराएँ नहीं:\n    - " + "\n    - ".join(avoid[-15:])
 
     prompt = f"""
     You are an expert exam setter for Indian competitive exams (UPSC, SSC CGL/CHSL, BPSC, State PCS, Banking, Railway, etc.).
@@ -80,24 +95,22 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
     2. If the user mentions a specific exam (e.g. BPSC, UPSC, SSC), strictly match that exam's difficulty and standard.
     3. If the topic is static (History, Polity, Geography, Science, Math, Reasoning, Bihar Special), frame a concept-based or factually accurate question.
     4. If the topic is Current Affairs, focus on real verified developments, schemes, indices, or appointments.
-    5. Language: Bilingual/Hinglish (Hindi + English key terms).
+    5. LANGUAGE: Write the question, all options and the explanation in pure, standard Hindi using Devanagari script (शुद्ध हिंदी). Do not use Roman/Hinglish. Use English only where an official abbreviation is unavoidable.
     6. Keep question under 220 characters, each option under 90 characters, explanation under 180 characters.
     7. Provide 4 distinct options and 1 concise factual explanation.
     8. Return RAW JSON ONLY without any markdown backticks.{avoid_text}
 
     Required JSON Schema:
     {{
-      "question": "Question text here",
-      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "question": "प्रश्न यहाँ",
+      "options": ["विकल्प क", "विकल्प ख", "विकल्प ग", "विकल्प घ"],
       "correct_option_id": 0,
-      "explanation": "Clear 1-2 line explanation"
+      "explanation": "1-2 पंक्तियों में स्पष्ट व्याख्या"
     }}
     """
 
-    stable_models = GROQ_MODELS
-
     errors = []
-    for model_name in stable_models:
+    for model_name in GROQ_MODELS:
         try:
             chat_completion = await groq_client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
@@ -112,59 +125,61 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
             options = [str(o)[:100] for o in data["options"][:4]]
             cid = int(data["correct_option_id"])
             if len(options) < 2 or not (0 <= cid < len(options)):
-                raise ValueError("Invalid quiz data from model")
+                raise ValueError("मॉडल से अमान्य प्रश्न मिला")
             data["options"] = options
             data["correct_option_id"] = cid
             return data
         except Exception as e:
-            print(f"⚠️ Model {model_name} failed: {e}. Trying fallback...")
+            print(f"⚠️ मॉडल {model_name} विफल: {e}। अगला मॉडल आज़मा रहे हैं...")
             errors.append(f"{model_name}: {str(e)[:120]}")
 
     raise RuntimeError(" | ".join(errors))
 
 
-# ==================== SCOREBOARD ====================
+# ==================== परिणाम तालिका ====================
 
 def build_leaderboard(session: dict, finished: bool = True) -> str:
     total = session["asked"]
     scores = session["scores"]
 
     if not scores:
-        return "😶 Kisi ne bhi answer nahi diya, isliye leaderboard khali hai."
+        return "😶 किसी ने भी उत्तर नहीं दिया, इसलिए परिणाम तालिका खाली है।"
 
     rows = []
     for uid, s in scores.items():
         attempted = s["correct"] + s["wrong"]
-        skipped = total - attempted
+        skipped = max(total - attempted, 0)
         rows.append((uid, s, skipped))
 
-    # Zyada sahi -> upar. Tie ho to kam total time wala upar.
+    # अधिक सही उत्तर वाला ऊपर; बराबरी पर कम कुल समय वाला ऊपर
     rows.sort(key=lambda r: (-r[1]["correct"], r[1]["time"]))
 
-    medals = ["🥇", "🥈", "🥉"]
-    title = "🏆 **Final Leaderboard**" if finished else "📊 **Current Leaderboard**"
-    lines = [f"{title}\n📝 Total Questions: `{total}`\n"]
+    rank_labels = ["🥇 प्रथम स्थान", "🥈 द्वितीय स्थान", "🥉 तृतीय स्थान"]
+    title = "🏆 **अंतिम परिणाम**" if finished else "📊 **अब तक का परिणाम**"
+    lines = [f"{title}\n📝 कुल प्रश्न: `{total}`\n"]
 
     for i, (uid, s, skipped) in enumerate(rows):
-        medal = medals[i] if i < 3 else f"{i + 1}."
+        label = rank_labels[i] if i < 3 else f"{i + 1}. स्थान"
         lines.append(
-            f"{medal} **{s['name']}**\n"
-            f"    ✅ Sahi: `{s['correct']}`  ❌ Galat: `{s['wrong']}`  ⏭ Skip: `{skipped}`\n"
-            f"    ⏱ Total time: `{s['time']:.1f}s`"
+            f"{label} — **{s['name']}**\n"
+            f"    ✅ सही: `{s['correct']}`   ❌ गलत: `{s['wrong']}`   ⏭ छोड़े गए: `{skipped}`\n"
+            f"    ⏱ कुल समय: `{s['time']:.1f}` सेकंड"
         )
 
-    first = rows[0][1]["name"]
-    lines.append(f"\n👑 **Winner:** {first}")
+    lines.append(f"\n👑 **विजेता (प्रथम):** {rows[0][1]['name']}")
     if len(rows) > 1:
-        lines.append(f"🥈 **Second:** {rows[1][1]['name']}")
+        lines.append(f"🥈 **द्वितीय:** {rows[1][1]['name']}")
+    if len(rows) > 2:
+        lines.append(f"🥉 **तृतीय:** {rows[2][1]['name']}")
+    lines.append("\n🙏 सभी प्रतिभागियों का धन्यवाद!")
     return "\n".join(lines)
 
 
 async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
     session = SESSIONS[chat_id]
     asked_questions = []
-
     next_task = None
+
     try:
         next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
 
@@ -172,18 +187,18 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
             try:
                 data = await next_task
             except Exception as e:
-                await client.send_message(chat_id, f"❌ Question {i} generate nahi ho saka: `{e}`")
+                await safe_send(client, chat_id, f"❌ प्रश्न {i} नहीं बन सका।\n`{str(e)[:300]}`")
                 if i < total:
                     next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
                 continue
 
             asked_questions.append(data["question"][:120])
 
-            # Agla question abhi se background me taiyar karo
+            # अगला प्रश्न अभी से पृष्ठभूमि में तैयार करना
             if i < total:
                 next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
 
-            question_text = f"[{i}/{total}] ⏱{TIMER_SECONDS}s | {data['question']}"[:300]
+            question_text = f"[{i}/{total}] ⏱{TIMER_SECONDS} सेकंड | {data['question']}"[:300]
             sent = await client.send_poll(
                 chat_id=chat_id,
                 question=question_text,
@@ -195,7 +210,8 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
                 open_period=TIMER_SECONDS
             )
 
-            poll_id = sent.poll.id
+            # महत्वपूर्ण: Pyrogram में poll.id टेक्स्ट होता है, वोट अपडेट में संख्या; इसलिए int में बदलें
+            poll_id = int(sent.poll.id)
             POLL_TO_CHAT[poll_id] = chat_id
             session["polls"][poll_id] = {
                 "correct": data["correct_option_id"],
@@ -204,14 +220,17 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
             }
             session["asked"] += 1
 
-            # Poll ka time khatam hone tak ruko, uske baad hi agla question
+            # समय पूरा होने तक रुकें, उसके बाद ही अगला प्रश्न
             await asyncio.sleep(TIMER_SECONDS + 1)
 
-        await client.send_message(chat_id, build_leaderboard(session, finished=True))
+        await safe_send(client, chat_id, build_leaderboard(session, finished=True))
 
     except asyncio.CancelledError:
-        await client.send_message(chat_id, "🛑 **Quiz rok diya gaya.**\n\n" + build_leaderboard(session, finished=False))
+        await safe_send(client, chat_id, "🛑 **प्रश्नोत्तरी रोक दी गई।**\n\n" + build_leaderboard(session, finished=False))
         raise
+    except Exception as e:
+        print(f"❌ प्रश्नोत्तरी में त्रुटि: {e}")
+        await safe_send(client, chat_id, f"❌ प्रश्नोत्तरी में त्रुटि आई।\n`{str(e)[:300]}`\n\n" + build_leaderboard(session, finished=False))
     finally:
         if next_task and not next_task.done():
             next_task.cancel()
@@ -220,52 +239,55 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
         SESSIONS.pop(chat_id, None)
 
 
-# ==================== VOTE TRACKING ====================
+# ==================== वोट की गिनती ====================
 
 @app.on_raw_update(group=-1)
 async def vote_tracker(client, update, users, chats):
     if not isinstance(update, raw.types.UpdateMessagePollVote):
         return
 
-    chat_id = POLL_TO_CHAT.get(update.poll_id)
-    if chat_id is None:
-        return
+    try:
+        chat_id = POLL_TO_CHAT.get(int(update.poll_id))
+        if chat_id is None:
+            return
 
-    session = SESSIONS.get(chat_id)
-    if not session:
-        return
+        session = SESSIONS.get(chat_id)
+        if not session:
+            return
 
-    poll = session["polls"].get(update.poll_id)
-    if not poll or not update.options:
-        return
+        poll = session["polls"].get(int(update.poll_id))
+        if not poll or not update.options:
+            return
 
-    user_id = getattr(update.peer, "user_id", None)
-    if user_id is None or user_id in poll["voted"]:
-        return
-    poll["voted"].add(user_id)
+        user_id = getattr(update.peer, "user_id", None)
+        if user_id is None or user_id in poll["voted"]:
+            return
+        poll["voted"].add(user_id)
 
-    chosen = update.options[0][0]  # option index (single byte)
-    elapsed = time.time() - poll["sent_at"]
+        chosen = update.options[0][0]  # विकल्प का क्रमांक
+        elapsed = time.time() - poll["sent_at"]
 
-    user = users.get(user_id)
-    if user:
-        name = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
-        name = name.strip() or f"User {user_id}"
-    else:
-        name = f"User {user_id}"
+        user = users.get(user_id)
+        if user:
+            full = (user.first_name or "") + (" " + user.last_name if user.last_name else "")
+            name = clean_name(full) or f"उपयोगकर्ता {user_id}"
+        else:
+            name = f"उपयोगकर्ता {user_id}"
 
-    s = session["scores"].setdefault(user_id, {"name": name, "correct": 0, "wrong": 0, "time": 0.0})
-    if chosen == poll["correct"]:
-        s["correct"] += 1
-    else:
-        s["wrong"] += 1
-    s["time"] += elapsed
+        s = session["scores"].setdefault(user_id, {"name": name, "correct": 0, "wrong": 0, "time": 0.0})
+        if chosen == poll["correct"]:
+            s["correct"] += 1
+        else:
+            s["wrong"] += 1
+        s["time"] += elapsed
+    except Exception as e:
+        print(f"⚠️ वोट दर्ज करने में त्रुटि: {e}")
 
 
-# ==================== DUMMY WEB SERVER ====================
+# ==================== डमी वेब सर्वर ====================
 
 async def handle_ping(request):
-    return web.Response(text="Bot is running active 24/7!")
+    return web.Response(text="बॉट सक्रिय है!")
 
 
 async def start_dummy_server():
@@ -276,24 +298,35 @@ async def start_dummy_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Dummy web server listening on port {port}")
+    print(f"🌐 वेब सर्वर पोर्ट {port} पर चालू है")
 
 
-# ==================== COMMAND HANDLERS ====================
+# ==================== कमांड ====================
+
+def timer_buttons():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("15 सेकंड", callback_data="set_time_15"),
+            InlineKeyboardButton("30 सेकंड", callback_data="set_time_30"),
+            InlineKeyboardButton("45 सेकंड", callback_data="set_time_45"),
+            InlineKeyboardButton("60 सेकंड", callback_data="set_time_60")
+        ]
+    ])
+
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
     text = (
-        "👋 **Namaste! Main Universal Competition Quiz Bot hoon.**\n\n"
-        "🎯 UPSC, SSC, BPSC, Railway, Banking, Current Affairs, kisi bhi topic ka quiz chalayein.\n\n"
-        "Example: `/ca 10 bpsc bihar history`\n\n"
-        "📖 Commands ke liye **/help** dabayein.\n"
-        "⚠️ AI se bane answers ko ek baar verify zaroor karein."
+        "🙏 **नमस्कार! मैं प्रतियोगी परीक्षा प्रश्नोत्तरी बॉट हूँ।**\n\n"
+        "🎯 UPSC, SSC, BPSC, रेलवे, बैंकिंग, समसामयिकी, किसी भी विषय की प्रश्नोत्तरी चलाएँ।\n\n"
+        "उदाहरण: `/ca 10 बिहार का इतिहास`\n\n"
+        "📖 सभी आदेश जानने के लिए **/help** दबाएँ।\n"
+        "⚠️ कृत्रिम बुद्धिमत्ता से बने उत्तरों की एक बार पुष्टि अवश्य कर लें।"
     )
     buttons = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📖 Help Guide", callback_data="btn_help"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="btn_settings")
+            InlineKeyboardButton("📖 सहायता", callback_data="btn_help"),
+            InlineKeyboardButton("⚙️ व्यवस्थाएँ", callback_data="btn_settings")
         ]
     ])
     await message.reply_text(text, reply_markup=buttons)
@@ -302,17 +335,17 @@ async def start_handler(client: Client, message: Message):
 @app.on_message(filters.command("help"))
 async def help_handler(client: Client, message: Message):
     help_text = (
-        "📚 **Quiz Command Guide:**\n\n"
-        f"🔹 `/ca <kitne> <topic>` - Multiple questions ka quiz (max {MAX_QUESTIONS})\n"
-        "   • `/ca 10 bpsc bihar special history`\n"
-        "   • `/ca 5 upsc polity`\n"
-        "   • `/ca 15 ssc cgl science`\n"
-        "   • `/ca` - 1 question (mixed GS)\n\n"
-        "🔹 `/score` - Chalte quiz ka current leaderboard\n"
-        "🔹 `/stopquiz` - Chalta quiz rokein (Owner only)\n"
-        "🔹 `/settings` - Timer customize karein\n"
-        "🔹 `/setgroup` - Group authorize karein (Owner only)\n"
-        "🔹 `/id` - Chat ID aur User ID"
+        "📚 **आदेश मार्गदर्शिका:**\n\n"
+        f"🔹 `/ca <संख्या> <विषय>` — कई प्रश्नों की प्रश्नोत्तरी (अधिकतम {MAX_QUESTIONS})\n"
+        "   • `/ca 10 बिहार विशेष इतिहास`\n"
+        "   • `/ca 5 भारतीय राजव्यवस्था`\n"
+        "   • `/ca 15 सामान्य विज्ञान`\n"
+        "   • `/ca` — 1 प्रश्न (मिश्रित सामान्य ज्ञान)\n\n"
+        "🔹 `/score` — चल रही प्रश्नोत्तरी की अब तक की परिणाम तालिका\n"
+        "🔹 `/stopquiz` — चल रही प्रश्नोत्तरी रोकें (केवल स्वामी)\n"
+        "🔹 `/settings` — समय-सीमा बदलें\n"
+        "🔹 `/setgroup` — समूह को अधिकृत करें (केवल स्वामी)\n"
+        "🔹 `/id` — चैट और उपयोगकर्ता की पहचान संख्या"
     )
     await message.reply_text(help_text)
 
@@ -322,8 +355,8 @@ async def id_handler(client: Client, message: Message):
     if not message.from_user:
         return
     await message.reply_text(
-        f"📌 **Chat ID:** `{message.chat.id}`\n"
-        f"👤 **User ID:** `{message.from_user.id}`"
+        f"📌 **चैट आईडी:** `{message.chat.id}`\n"
+        f"👤 **उपयोगकर्ता आईडी:** `{message.from_user.id}`"
     )
 
 
@@ -332,19 +365,11 @@ async def settings_handler(client: Client, message: Message):
     if not message.from_user:
         return
     if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ **Yeh command sirf Owner use kar sakta hai!**")
+        await message.reply_text("⛔ **यह आदेश केवल स्वामी के लिए है!**")
         return
 
-    text = f"⚙️ **Quiz Settings:**\n\n⏱️ **Current Timer:** `{TIMER_SECONDS}` Seconds\nNaya timer chunein:"
-    buttons = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("15s", callback_data="set_time_15"),
-            InlineKeyboardButton("30s", callback_data="set_time_30"),
-            InlineKeyboardButton("45s", callback_data="set_time_45"),
-            InlineKeyboardButton("60s", callback_data="set_time_60")
-        ]
-    ])
-    await message.reply_text(text, reply_markup=buttons)
+    text = f"⚙️ **प्रश्नोत्तरी व्यवस्थाएँ:**\n\n⏱️ **वर्तमान समय-सीमा:** `{TIMER_SECONDS}` सेकंड\nनई समय-सीमा चुनें:"
+    await message.reply_text(text, reply_markup=timer_buttons())
 
 
 @app.on_message(filters.command("setgroup") & filters.group)
@@ -352,16 +377,16 @@ async def setgroup_handler(client: Client, message: Message):
     if not message.from_user:
         return
     if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ **Sirf Owner hi group set kar sakta hai!**")
+        await message.reply_text("⛔ **केवल स्वामी ही समूह अधिकृत कर सकता है!**")
         return
 
     if message.chat.id not in ALLOWED_CHAT_IDS:
         ALLOWED_CHAT_IDS.append(message.chat.id)
 
     await message.reply_text(
-        f"✅ **Group Authorized Successfully!**\n\n"
-        f"📌 **Group:** {message.chat.title}\n"
-        f"🆔 **Chat ID:** `{message.chat.id}`"
+        f"✅ **समूह सफलतापूर्वक अधिकृत हो गया!**\n\n"
+        f"📌 **समूह:** {message.chat.title}\n"
+        f"🆔 **चैट आईडी:** `{message.chat.id}`"
     )
 
 
@@ -373,12 +398,12 @@ async def exam_quiz_handler(client: Client, message: Message):
         return
 
     if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ **Yeh command sirf Group Owner ke liye reserved hai!**")
+        await message.reply_text("⛔ **यह आदेश केवल समूह स्वामी के लिए सुरक्षित है!**")
         return
 
     chat_id = message.chat.id
     if chat_id in SESSIONS:
-        await message.reply_text("⚠️ Is chat me quiz pehle se chal raha hai. Rokne ke liye /stopquiz use karein.")
+        await message.reply_text("⚠️ इस चैट में प्रश्नोत्तरी पहले से चल रही है। रोकने के लिए /stopquiz का प्रयोग करें।")
         return
 
     args = message.command[1:]
@@ -387,7 +412,7 @@ async def exam_quiz_handler(client: Client, message: Message):
         total = max(1, min(int(args[0]), MAX_QUESTIONS))
         args = args[1:]
 
-    topic = " ".join(args) if args else "Mix GS and Recent Current Affairs for UPSC/SSC/BPSC"
+    topic = " ".join(args) if args else "UPSC/SSC/BPSC के लिए सामान्य ज्ञान और हाल की समसामयिकी का मिश्रण"
 
     SESSIONS[chat_id] = {
         "scores": {},
@@ -397,11 +422,11 @@ async def exam_quiz_handler(client: Client, message: Message):
     }
 
     await message.reply_text(
-        f"🎯 **Quiz Start!**\n\n"
-        f"📚 Topic: `{topic}`\n"
-        f"📝 Questions: `{total}`\n"
-        f"⏱ Har question: `{TIMER_SECONDS}s`\n\n"
-        f"Taiyar ho jaiye, pehla question aa raha hai..."
+        f"🎯 **प्रश्नोत्तरी आरंभ!**\n\n"
+        f"📚 विषय: `{topic}`\n"
+        f"📝 कुल प्रश्न: `{total}`\n"
+        f"⏱ प्रत्येक प्रश्न का समय: `{TIMER_SECONDS}` सेकंड\n\n"
+        f"तैयार हो जाइए, पहला प्रश्न आ रहा है..."
     )
 
     SESSIONS[chat_id]["task"] = asyncio.create_task(run_quiz(client, chat_id, topic, total))
@@ -412,12 +437,12 @@ async def stop_handler(client: Client, message: Message):
     if not message.from_user:
         return
     if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ Sirf Owner quiz rok sakta hai!")
+        await message.reply_text("⛔ केवल स्वामी ही प्रश्नोत्तरी रोक सकता है!")
         return
 
     session = SESSIONS.get(message.chat.id)
     if not session:
-        await message.reply_text("ℹ️ Abhi koi quiz nahi chal raha.")
+        await message.reply_text("ℹ️ अभी कोई प्रश्नोत्तरी नहीं चल रही।")
         return
     session["task"].cancel()
 
@@ -426,12 +451,12 @@ async def stop_handler(client: Client, message: Message):
 async def score_handler(client: Client, message: Message):
     session = SESSIONS.get(message.chat.id)
     if not session:
-        await message.reply_text("ℹ️ Abhi koi quiz nahi chal raha.")
+        await message.reply_text("ℹ️ अभी कोई प्रश्नोत्तरी नहीं चल रही।")
         return
-    await message.reply_text(build_leaderboard(session, finished=False))
+    await safe_send(client, message.chat.id, build_leaderboard(session, finished=False))
 
 
-# ==================== CALLBACK BUTTON HANDLERS ====================
+# ==================== बटन ====================
 
 @app.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
@@ -441,82 +466,74 @@ async def callback_handler(client: Client, query: CallbackQuery):
     if data == "btn_help":
         await query.answer()
         await query.message.reply_text(
-            "🔹 `/ca <kitne> <topic>` - Quiz chalayein\n"
-            "🔹 `/score` - Current leaderboard\n"
-            "🔹 `/stopquiz` - Quiz rokein\n"
-            "🔹 `/settings` - Timer badalein\n"
-            "🔹 `/id` - Chat ID check karein"
+            "🔹 `/ca <संख्या> <विषय>` — प्रश्नोत्तरी चलाएँ\n"
+            "🔹 `/score` — अब तक का परिणाम\n"
+            "🔹 `/stopquiz` — प्रश्नोत्तरी रोकें\n"
+            "🔹 `/settings` — समय-सीमा बदलें\n"
+            "🔹 `/id` — चैट आईडी देखें"
         )
 
     elif data == "btn_settings":
         if not await is_owner(client, query.message.chat.id, query.from_user.id):
-            await query.answer("⛔ Sirf Owner settings badal sakta hai!", show_alert=True)
+            await query.answer("⛔ केवल स्वामी व्यवस्थाएँ बदल सकता है!", show_alert=True)
             return
         await query.answer()
-        buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("15s", callback_data="set_time_15"),
-                InlineKeyboardButton("30s", callback_data="set_time_30"),
-                InlineKeyboardButton("45s", callback_data="set_time_45"),
-                InlineKeyboardButton("60s", callback_data="set_time_60")
-            ]
-        ])
-        await query.message.reply_text("⏱️ Timer select karein:", reply_markup=buttons)
+        await query.message.reply_text("⏱️ समय-सीमा चुनें:", reply_markup=timer_buttons())
 
     elif data.startswith("set_time_"):
         if not await is_owner(client, query.message.chat.id, query.from_user.id):
-            await query.answer("⛔ Sirf Owner timer change kar sakta hai!", show_alert=True)
+            await query.answer("⛔ केवल स्वामी समय-सीमा बदल सकता है!", show_alert=True)
             return
         TIMER_SECONDS = int(data.split("_")[2])
-        await query.answer(f"✅ Timer {TIMER_SECONDS}s par set ho gaya!", show_alert=True)
-        await query.message.edit_text(f"✅ **Timer updated:** `{TIMER_SECONDS}` Seconds")
+        await query.answer(f"✅ समय-सीमा {TIMER_SECONDS} सेकंड कर दी गई!", show_alert=True)
+        await query.message.edit_text(f"✅ **समय-सीमा अद्यतन:** `{TIMER_SECONDS}` सेकंड")
 
 
-# ==================== STARTUP ====================
+# ==================== आरंभ ====================
 
 async def send_startup_alert():
     target_id = LOG_GROUP_ID if LOG_GROUP_ID else OWNER_ID
     if not target_id:
-        print("⚠️ LOG_GROUP_ID aur OWNER_ID dono set nahi hain. Startup alert skip.")
+        print("⚠️ LOG_GROUP_ID और OWNER_ID दोनों निर्धारित नहीं हैं। सूचना छोड़ दी गई।")
         return
     try:
         bot_info = await app.get_me()
         await app.send_message(
             chat_id=target_id,
             text=(
-                "🚀 **Universal Quiz Bot Started!**\n\n"
-                f"🤖 **Bot:** @{bot_info.username}\n"
-                f"⏱️ **Default Timer:** `{TIMER_SECONDS}s`\n"
-                "⚡ **Status:** Active & Ready!"
+                "🚀 **प्रश्नोत्तरी बॉट सफलतापूर्वक चालू हो गया!**\n\n"
+                f"🤖 **बॉट:** @{bot_info.username}\n"
+                f"⏱️ **डिफ़ॉल्ट समय-सीमा:** `{TIMER_SECONDS}` सेकंड\n"
+                "⚡ **स्थिति:** सक्रिय और तैयार!"
             )
         )
     except Exception as e:
-        print(f"❌ Startup alert error (Target ID: {target_id}): {e}")
+        print(f"❌ आरंभ सूचना में त्रुटि (लक्ष्य आईडी: {target_id}): {e}")
 
 
 async def set_menu_suggestions():
     await asyncio.sleep(2)
     try:
         await app.set_bot_commands([
-            BotCommand("ca", "Quiz chalayein: /ca 10 topic"),
-            BotCommand("score", "Current leaderboard dekhein"),
-            BotCommand("stopquiz", "Chalta quiz rokein"),
-            BotCommand("settings", "Quiz Timer settings"),
-            BotCommand("setgroup", "Group authorize karein"),
-            BotCommand("id", "Group aur User ID"),
-            BotCommand("help", "Help guide"),
-            BotCommand("start", "Bot start karein")
+            BotCommand("ca", "प्रश्नोत्तरी चलाएँ: /ca 10 विषय"),
+            BotCommand("score", "अब तक का परिणाम देखें"),
+            BotCommand("stopquiz", "चल रही प्रश्नोत्तरी रोकें"),
+            BotCommand("settings", "समय-सीमा की व्यवस्था"),
+            BotCommand("setgroup", "समूह को अधिकृत करें"),
+            BotCommand("id", "चैट और उपयोगकर्ता आईडी"),
+            BotCommand("help", "सहायता मार्गदर्शिका"),
+            BotCommand("start", "बॉट आरंभ करें")
         ])
-        print("✅ Command menu set!")
+        print("✅ आदेश सूची निर्धारित हो गई!")
     except Exception as e:
-        print(f"⚠️ Suggestions set warning: {e}")
+        print(f"⚠️ आदेश सूची चेतावनी: {e}")
 
 
 async def main():
     await start_dummy_server()
-    print("🚀 Connecting Pyrogram Client to Telegram...")
+    print("🚀 टेलीग्राम से जुड़ रहे हैं...")
     await app.start()
-    print("✅ Pyrogram Client Connected!")
+    print("✅ बॉट जुड़ गया और संदेशों की प्रतीक्षा में है!")
     await send_startup_alert()
     asyncio.create_task(set_menu_suggestions())
     await idle()
