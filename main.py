@@ -28,6 +28,14 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TIMER_SECONDS = int(os.getenv("TIMER_SECONDS", "30"))
 MAX_QUESTIONS = 25
 
+# Comma-separated list in env, e.g. GROQ_MODELS="openai/gpt-oss-120b,openai/gpt-oss-20b"
+# (Groq models retire often; check https://console.groq.com/docs/models)
+GROQ_MODELS = [
+    m.strip()
+    for m in os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b").split(",")
+    if m.strip()
+]
+
 raw_chats = os.getenv("ALLOWED_CHAT_IDS", "")
 ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in raw_chats.split(",") if cid.strip()]
 
@@ -86,9 +94,9 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
     }}
     """
 
-    stable_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    stable_models = GROQ_MODELS
 
-    last_error = None
+    errors = []
     for model_name in stable_models:
         try:
             chat_completion = await groq_client.chat.completions.create(
@@ -97,7 +105,9 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
                 temperature=0.5,
                 response_format={"type": "json_object"}
             )
-            data = json.loads(chat_completion.choices[0].message.content.strip())
+            content = chat_completion.choices[0].message.content.strip()
+            content = content.replace("```json", "").replace("```", "").strip()
+            data = json.loads(content)
 
             options = [str(o)[:100] for o in data["options"][:4]]
             cid = int(data["correct_option_id"])
@@ -108,9 +118,9 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
             return data
         except Exception as e:
             print(f"⚠️ Model {model_name} failed: {e}. Trying fallback...")
-            last_error = e
+            errors.append(f"{model_name}: {str(e)[:120]}")
 
-    raise last_error
+    raise RuntimeError(" | ".join(errors))
 
 
 # ==================== SCOREBOARD ====================
@@ -154,15 +164,24 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
     session = SESSIONS[chat_id]
     asked_questions = []
 
+    next_task = None
     try:
+        next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
+
         for i in range(1, total + 1):
             try:
-                data = await generate_universal_quiz(topic, asked_questions)
+                data = await next_task
             except Exception as e:
                 await client.send_message(chat_id, f"❌ Question {i} generate nahi ho saka: `{e}`")
+                if i < total:
+                    next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
                 continue
 
             asked_questions.append(data["question"][:120])
+
+            # Agla question abhi se background me taiyar karo
+            if i < total:
+                next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
 
             question_text = f"[{i}/{total}] ⏱{TIMER_SECONDS}s | {data['question']}"[:300]
             sent = await client.send_poll(
@@ -185,8 +204,8 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
             }
             session["asked"] += 1
 
-            # Poll band hone tak + 2 sec ruko
-            await asyncio.sleep(TIMER_SECONDS + 2)
+            # Poll ka time khatam hone tak ruko, uske baad hi agla question
+            await asyncio.sleep(TIMER_SECONDS + 1)
 
         await client.send_message(chat_id, build_leaderboard(session, finished=True))
 
@@ -194,6 +213,8 @@ async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
         await client.send_message(chat_id, "🛑 **Quiz rok diya gaya.**\n\n" + build_leaderboard(session, finished=False))
         raise
     finally:
+        if next_task and not next_task.done():
+            next_task.cancel()
         for pid in list(session["polls"].keys()):
             POLL_TO_CHAT.pop(pid, None)
         SESSIONS.pop(chat_id, None)
