@@ -39,26 +39,29 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 
 async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
+    """Check owner status (Global Bot Owner or Group Creator)."""
     if OWNER_ID and user_id == OWNER_ID:
         return True
     try:
         member = await client.get_chat_member(chat_id, user_id)
         return member.status == ChatMemberStatus.OWNER
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Error checking owner status: {e}")
         return False
 
 
 async def generate_exam_ca_quiz(category: str) -> dict:
+    """Groq Llama-3.1-8b-instant se MCQ quiz generate karna."""
     prompt = f"""
     Create 1 high-yield, factual Multiple Choice Question (MCQ) for competitive exams (UPSC/SSC/State PCS/Banking).
     Target Topic/Domain: {category}.
-    Focus: Recent events, government schemes, summits, military exercises, indices, appointments, or sports.
+    Focus: Recent events, government schemes, summits, military exercises, indices, appointments, economy, or sports.
     Language: Bilingual/Hinglish.
 
     Rules:
     - 4 realistic and distinct options.
-    - Provide an informative 1-2 line explanation.
-    - Return RAW JSON ONLY.
+    - Provide an informative 1-2 line factual explanation.
+    - Return RAW JSON ONLY matching the schema.
 
     JSON Schema:
     {{
@@ -84,6 +87,7 @@ async def generate_exam_ca_quiz(category: str) -> dict:
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
+    print(f"📥 /start received from user: {message.from_user.id}")
     text = (
         "👋 **Namaste! Main Competition Current Affairs Quiz Bot hoon.**\n\n"
         "🎯 Yahan UPSC, SSC, Banking aur State Exams ke liye daily latest current affairs aur GS practice kar sakte hain.\n\n"
@@ -100,19 +104,32 @@ async def start_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("help"))
 async def help_handler(client: Client, message: Message):
+    print(f"📥 /help received from user: {message.from_user.id}")
     help_text = (
         "📚 **Bot Command Guide:**\n\n"
         "🔹 `/ca` - Latest General Current Affairs question send karega.\n"
         "🔹 `/ca <topic>` - Specific topic par question generate karega.\n"
+        "   _Example: `/ca Schemes`, `/ca Defence`, `/ca Sports`_\n"
         "🔹 `/settings` - Quiz Timer settings badalne ke liye.\n"
-        "🔹 `/setgroup` - Is group ko authorized group list me set karein (Owner only).\n"
-        "🔹 `/help` - Is help menu ko dekhne ke liye."
+        "🔹 `/setgroup` - Is group ko authorized list me lock karein (Owner only).\n"
+        "🔹 `/id` - Chat ID aur User ID dekhne ke liye.\n"
+        "🔹 `/help` - Is help menu ko dekhne ke liye.\n\n"
+        "⚠️ _Note: Quiz start karne aur settings badalne ki permission sirf Owner ke paas hai._"
     )
     await message.reply_text(help_text)
 
 
+@app.on_message(filters.command("id"))
+async def id_handler(client: Client, message: Message):
+    await message.reply_text(
+        f"📌 **Chat ID:** `{message.chat.id}`\n"
+        f"👤 **User ID:** `{message.from_user.id}`"
+    )
+
+
 @app.on_message(filters.command("settings"))
 async def settings_handler(client: Client, message: Message):
+    print(f"📥 /settings received from user: {message.from_user.id}")
     if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Yeh command sirf Owner use kar sakta hai!**")
         return
@@ -131,6 +148,7 @@ async def settings_handler(client: Client, message: Message):
 
 @app.on_message(filters.command("setgroup") & filters.group)
 async def setgroup_handler(client: Client, message: Message):
+    print(f"📥 /setgroup in chat: {message.chat.id} by: {message.from_user.id}")
     if not await is_owner(client, message.chat.id, message.from_user.id):
         await message.reply_text("⛔ **Sirf Owner hi group set kar sakta hai!**")
         return
@@ -145,12 +163,20 @@ async def setgroup_handler(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.command("ca") & filters.group)
+@app.on_message(filters.command("ca"))
 async def exam_quiz_handler(client: Client, message: Message):
+    print(f"📥 /ca received in Chat: {message.chat.id} from User: {message.from_user.id}")
+
+    # 1. Allowed Group Restriction
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
+        print(f"🚫 Chat {message.chat.id} not in ALLOWED_CHAT_IDS: {ALLOWED_CHAT_IDS}")
         return
 
-    if not await is_owner(client, message.chat.id, message.from_user.id):
+    # 2. Strict Owner Check
+    owner_check = await is_owner(client, message.chat.id, message.from_user.id)
+    print(f"👤 User {message.from_user.id} Owner Status: {owner_check}")
+
+    if not owner_check:
         await message.reply_text("⛔ **Yeh command sirf Group Owner ke liye reserved hai!**")
         return
 
@@ -177,8 +203,11 @@ async def exam_quiz_handler(client: Client, message: Message):
         await status_msg.delete()
 
     except Exception as e:
+        print(f"❌ Error generating/sending quiz: {e}")
         await status_msg.edit_text(f"❌ Error: Question generate nahi ho saka.\n`{e}`")
 
+
+# ==================== CALLBACK BUTTON HANDLERS ====================
 
 @app.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
@@ -216,13 +245,12 @@ async def callback_handler(client: Client, query: CallbackQuery):
         await query.message.edit_text(f"✅ **Timer updated:** `{TIMER_SECONDS}` Seconds")
 
 
-# ==================== WEB SERVER (RENDER PORT BIND) ====================
+# ==================== WEB SERVER (RENDER DUMMY PORT) ====================
 
 async def handle_ping(request):
     return web.Response(text="Bot is running active!")
 
 async def start_web_server():
-    """Render ke port scan error ko khatam karne ke liye simple web server."""
     port = int(os.environ.get("PORT", 8080))
     server = web.Application()
     server.router.add_get("/", handle_ping)
@@ -230,25 +258,24 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"✅ Web server listening on port {port} (Render Port Bind Done)")
+    print(f"✅ Web server listening on port {port} (Render Port Bind Successful)")
 
 
-# ==================== MAIN STARTUP ====================
+# ==================== BOT RUNNER ====================
 
 async def main():
-    # 1. Pehle dummy web server chalu karein taaki Render port detect kar le
     await start_web_server()
 
-    # 2. Pyrogram client start karein
-    print("Owner CA Quiz Bot start ho raha hai...")
+    print("Owner CA Quiz Bot starting Pyrogram...")
     await app.start()
 
-    # 3. Client start hone ke BAAD menu commands set karein
+    # Commands list set karna
     try:
         commands = [
             BotCommand("ca", "Start Current Affairs Quiz (Owner Only)"),
             BotCommand("settings", "Configure Quiz Timer & Settings"),
             BotCommand("setgroup", "Authorize this group for quizzes"),
+            BotCommand("id", "Get Group and User IDs"),
             BotCommand("help", "Show help and command guide"),
             BotCommand("start", "Start the bot interface")
         ]
@@ -257,7 +284,6 @@ async def main():
     except Exception as e:
         print(f"⚠️ Command menu set warning: {e}")
 
-    # 4. Bot ko continuously run rakhein
     await idle()
     await app.stop()
 
