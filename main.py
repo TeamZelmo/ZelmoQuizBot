@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import time
 import asyncio
 from aiohttp import web
@@ -36,39 +37,19 @@ GROQ_MODELS = [
     if m.strip()
 ]
 
+# फोटो से प्रश्न बनाने वाला (vision) मॉडल; बदलना हो तो env में GROQ_VISION_MODELS रखें
+GROQ_VISION_MODELS = [
+    m.strip()
+    for m in os.getenv("GROQ_VISION_MODELS", "qwen/qwen3.8-27b").split(",")
+    if m.strip()
+]
+
+# जिन समूहों में फोटो-से-प्रश्न बंद किया गया है
+PHOTO_QUIZ_OFF = set()
+
 raw_chats = os.getenv("ALLOWED_CHAT_IDS", "")
 ALLOWED_CHAT_IDS = [int(cid.strip()) for cid in raw_chats.split(",") if cid.strip()]
 
-# स्थायी अनुमति: env में कॉमा से अलग उपयोगकर्ता आईडी, जैसे ALLOWED_USER_IDS="123,456" (सभी समूहों में मान्य)
-raw_users = os.getenv("ALLOWED_USER_IDS", "")
-GLOBAL_ALLOWED_USERS = {int(x.strip()) for x in raw_users.split(",") if x.strip().lstrip("-").isdigit()}
-
-# /allow से दी गई अनुमति: chat_id -> उपयोगकर्ता आईडी का समूह (फ़ाइल में सहेजी जाती है)
-AUTH_FILE = "auth_users.json"
-AUTH_USERS = {}
-
-
-def load_auth():
-    try:
-        if os.path.exists(AUTH_FILE):
-            with open(AUTH_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for cid, ids in data.items():
-                AUTH_USERS[int(cid)] = {int(x) for x in ids}
-            print(f"✅ अनुमति सूची लोड हुई: {sum(len(v) for v in AUTH_USERS.values())} उपयोगकर्ता")
-    except Exception as e:
-        print(f"⚠️ अनुमति सूची लोड नहीं हो सकी: {e}")
-
-
-def save_auth():
-    try:
-        with open(AUTH_FILE, "w", encoding="utf-8") as f:
-            json.dump({str(c): sorted(ids) for c, ids in AUTH_USERS.items()}, f)
-    except Exception as e:
-        print(f"⚠️ अनुमति सूची सहेजी नहीं जा सकी: {e}")
-
-
-load_auth()
 
 app = Client(
     "competition_ca_bot",
@@ -94,32 +75,6 @@ async def is_owner(client: Client, chat_id: int, user_id: int) -> bool:
     except Exception as e:
         print(f"⚠️ स्वामी की जाँच में त्रुटि: {e}")
         return False
-
-
-async def can_run_quiz(client: Client, chat_id: int, user_id: int) -> bool:
-    """स्वामी, या जिसे अनुमति दी गई हो, वही प्रश्नोत्तरी चला सकता है।"""
-    if user_id in GLOBAL_ALLOWED_USERS:
-        return True
-    if user_id in AUTH_USERS.get(chat_id, set()):
-        return True
-    return await is_owner(client, chat_id, user_id)
-
-
-async def resolve_target(client: Client, message: Message):
-    """उत्तर (reply) वाले संदेश, संख्या-आईडी या @username से उपयोगकर्ता पहचानना।"""
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        return u.id, clean(u.first_name or "") or str(u.id)
-
-    if len(message.command) > 1:
-        arg = message.command[1].strip()
-        try:
-            u = await client.get_users(int(arg) if arg.lstrip("-").isdigit() else arg)
-            return u.id, clean(u.first_name or "") or str(u.id)
-        except Exception:
-            if arg.isdigit():
-                return int(arg), arg
-    return None, None
 
 
 def clean(text: str) -> str:
@@ -190,6 +145,85 @@ async def generate_universal_quiz(user_topic: str, avoid: list = None) -> dict:
             return data
         except Exception as e:
             print(f"⚠️ मॉडल {model_name} विफल: {e}। अगला मॉडल आज़मा रहे हैं...")
+            errors.append(f"{model_name}: {str(e)[:120]}")
+
+    raise RuntimeError(" | ".join(errors))
+
+
+# ==================== फोटो से प्रश्न ====================
+
+def extract_json(text: str) -> dict:
+    """मॉडल के उत्तर से JSON निकालना (think-ब्लॉक और कोड-बाड़ हटाकर)।"""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    text = text.replace("```json", "").replace("```", "")
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("उत्तर में JSON नहीं मिला")
+    return json.loads(text[start:end + 1])
+
+
+async def generate_quiz_from_image(image_bytes: bytes, hint: str = "") -> dict:
+    """प्रश्न की फोटो पढ़कर 4 विकल्पों वाला MCQ बनाना।"""
+    b64 = base64.b64encode(image_bytes).decode()
+    hint_text = f'\n    Extra note from the user about this image: "{hint}"' if hint else ""
+
+    prompt = f"""
+    You are an expert exam setter for Indian competitive exams. The image is a photo of an exam question. It may be in Hindi, English or mixed, and it may or may not already contain answer options.
+
+    Tasks:
+    1. Read the question carefully from the image.
+    2. If the image already shows options, use them (maximum 4). If it shows no options, create 4 plausible, distinct options.
+    3. Work out the correct answer yourself using your knowledge. Do NOT blindly trust any answer marked in the image.
+    4. If the image has no readable, self-contained question (for example it is not a question, or it depends on a figure that cannot be expressed in text), return only {{"is_question": false}}.
+    5. LANGUAGE: Write the question, options and explanation in pure, standard Hindi using Devanagari script (शुद्ध हिंदी). Translate English text into Hindi, but keep official abbreviations, numbers, names and formulas as they are.
+    6. Keep the question under 220 characters, each option under 90 characters, explanation under 180 characters.
+    7. Return RAW JSON ONLY without markdown backticks.{hint_text}
+
+    Required JSON Schema:
+    {{
+      "is_question": true,
+      "question": "प्रश्न यहाँ",
+      "options": ["विकल्प क", "विकल्प ख", "विकल्प ग", "विकल्प घ"],
+      "correct_option_id": 0,
+      "explanation": "1-2 पंक्तियों में स्पष्ट व्याख्या"
+    }}
+    """
+
+    errors = []
+    for model_name in GROQ_VISION_MODELS:
+        try:
+            completion = await groq_client.chat.completions.create(
+                model=model_name,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    ]
+                }],
+                temperature=0.2,
+                max_completion_tokens=2500,
+                response_format={"type": "json_object"}
+            )
+            data = extract_json(completion.choices[0].message.content)
+
+            if not data.get("is_question", True):
+                return {"is_question": False}
+
+            options = [str(o).strip()[:100] for o in data["options"][:4]]
+            cid = int(data["correct_option_id"])
+            if len(options) < 2 or not (0 <= cid < len(options)):
+                raise ValueError("मॉडल से अमान्य प्रश्न मिला")
+
+            return {
+                "is_question": True,
+                "question": str(data["question"]).strip(),
+                "options": options,
+                "correct_option_id": cid,
+                "explanation": str(data.get("explanation", "")).strip()
+            }
+        except Exception as e:
+            print(f"⚠️ विज़न मॉडल {model_name} विफल: {type(e).__name__}: {e}")
             errors.append(f"{model_name}: {str(e)[:120]}")
 
     raise RuntimeError(" | ".join(errors))
@@ -363,13 +397,21 @@ def build_leaderboard(session: dict, finished: bool = True) -> str:
     return text
 
 
-async def run_quiz(client: Client, chat_id: int, topic: str, total: int):
+async def _return_preset(data: dict) -> dict:
+    return data
+
+
+async def run_quiz(client: Client, chat_id: int, topic: str, total: int, preset: dict = None):
     session = SESSIONS[chat_id]
     asked_questions = []
     next_task = None
 
     try:
-        next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
+        if preset:
+            # फोटो से बना प्रश्न पहले से तैयार है
+            next_task = asyncio.create_task(_return_preset(preset))
+        else:
+            next_task = asyncio.create_task(generate_universal_quiz(topic, asked_questions))
 
         for i in range(1, total + 1):
             try:
@@ -491,11 +533,10 @@ async def help_handler(client: Client, message: Message):
         "   • `/ca 5 भारतीय राजव्यवस्था`\n"
         "   • `/ca 15 सामान्य विज्ञान`\n"
         "   • `/ca` — 1 प्रश्न (मिश्रित सामान्य ज्ञान)\n\n"
+        "📷 **फोटो से प्रश्न:** स्वामी किसी प्रश्न की फोटो समूह में डालें, "
+        "बॉट खुद 4 विकल्पों वाला प्रश्न बनाकर पूछेगा। (बंद/चालू: `/photoquiz on|off`)\n\n"
         "🔹 `/score` — चल रही प्रश्नोत्तरी की अब तक की परिणाम तालिका\n"
-        "🔹 `/stopquiz` — चल रही प्रश्नोत्तरी रोकें (स्वामी / अनुमति प्राप्त)\n"
-        "🔹 `/allow` — किसी को प्रश्नोत्तरी चलाने की अनुमति दें (केवल स्वामी; उसके संदेश पर reply करके लिखें)\n"
-        "🔹 `/disallow` — अनुमति हटाएँ (केवल स्वामी)\n"
-        "🔹 `/allowed` — अनुमति प्राप्त लोगों की सूची\n"
+        "🔹 `/stopquiz` — चल रही प्रश्नोत्तरी रोकें (केवल स्वामी)\n"
         "🔹 `/settings` — समय-सीमा बदलें\n"
         "🔹 `/setgroup` — समूह को अधिकृत करें (केवल स्वामी)\n"
         "🔹 `/id` — चैट और उपयोगकर्ता की पहचान संख्या"
@@ -550,11 +591,8 @@ async def exam_quiz_handler(client: Client, message: Message):
     if ALLOWED_CHAT_IDS and message.chat.id not in ALLOWED_CHAT_IDS:
         return
 
-    if not await can_run_quiz(client, message.chat.id, message.from_user.id):
-        await message.reply_text(
-            "⛔ **आपको प्रश्नोत्तरी चलाने की अनुमति नहीं है!**\n"
-            "समूह स्वामी से अनुमति (`/allow`) लेने को कहें।"
-        )
+    if not await is_owner(client, message.chat.id, message.from_user.id):
+        await message.reply_text("⛔ **यह आदेश केवल स्वामी (Owner) के लिए है!**")
         return
 
     chat_id = message.chat.id
@@ -588,86 +626,84 @@ async def exam_quiz_handler(client: Client, message: Message):
     SESSIONS[chat_id]["task"] = asyncio.create_task(run_quiz(client, chat_id, topic, total))
 
 
-@app.on_message(filters.command("allow") & filters.group)
-async def allow_handler(client: Client, message: Message):
+@app.on_message(filters.photo & filters.group)
+async def photo_quiz_handler(client: Client, message: Message):
+    """स्वामी प्रश्न की फोटो डालें तो बॉट MCQ बनाकर पूछे।"""
     if not message.from_user:
         return
-    if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ **केवल स्वामी ही अनुमति दे सकता है!**")
+    chat_id = message.chat.id
+    if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
+        return
+    if chat_id in PHOTO_QUIZ_OFF:
+        return
+    # स्वामी न हो तो चुप रहें, ताकि हर सदस्य की फोटो पर बॉट न बोले
+    if not await is_owner(client, chat_id, message.from_user.id):
         return
 
-    uid, name = await resolve_target(client, message)
-    if uid is None:
-        await message.reply_text(
-            "ℹ️ **उपयोग:**\n"
-            "• जिसे अनुमति देनी है उसके संदेश पर उत्तर (reply) देकर `/allow` लिखें\n"
-            "• या `/allow 123456789` (उपयोगकर्ता आईडी)\n"
-            "• या `/allow @username`"
-        )
+    if chat_id in SESSIONS:
+        await message.reply_text("⚠️ अभी प्रश्नोत्तरी चल रही है। उसके समाप्त होने के बाद फोटो भेजें।")
         return
 
-    AUTH_USERS.setdefault(message.chat.id, set()).add(uid)
-    save_auth()
-    await message.reply_text(
-        f"✅ **{name}** (`{uid}`) को इस समूह में प्रश्नोत्तरी चलाने की अनुमति दे दी गई।"
+    status = await message.reply_text("📷 फोटो पढ़कर प्रश्न बना रहे हैं, कृपया प्रतीक्षा करें...")
+
+    try:
+        buf = await client.download_media(message, in_memory=True)
+        if buf is None:
+            raise RuntimeError("फोटो डाउनलोड नहीं हो सकी")
+        image_bytes = buf.getvalue()
+
+        hint = (message.caption or "").strip()[:200]
+        data = await generate_quiz_from_image(image_bytes, hint)
+    except Exception as e:
+        print(f"❌ फोटो से प्रश्न बनाने में त्रुटि: {e}")
+        await status.edit_text(f"❌ फोटो से प्रश्न नहीं बन सका।\n`{clean(str(e))[:250]}`")
+        return
+
+    if not data.get("is_question"):
+        await status.edit_text("⚠️ इस फोटो में कोई स्पष्ट प्रश्न नहीं मिला। कृपया साफ़ और पूरे प्रश्न की फोटो भेजें।")
+        await asyncio.sleep(6)
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        return
+
+    # प्रश्न मिल गया: सत्र बनाकर प्रश्नोत्तरी चलाना
+    SESSIONS[chat_id] = {"scores": {}, "polls": {}, "asked": 0, "task": None}
+    await status.edit_text("✅ फोटो से प्रश्न तैयार! नीचे दिए प्रश्न का उत्तर दें।")
+    SESSIONS[chat_id]["task"] = asyncio.create_task(
+        run_quiz(client, chat_id, "फोटो से बना प्रश्न", 1, preset=data)
     )
 
 
-@app.on_message(filters.command("disallow") & filters.group)
-async def disallow_handler(client: Client, message: Message):
+@app.on_message(filters.command("photoquiz") & filters.group)
+async def photoquiz_toggle_handler(client: Client, message: Message):
     if not message.from_user:
         return
     if not await is_owner(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ **केवल स्वामी ही अनुमति हटा सकता है!**")
+        await message.reply_text("⛔ **यह आदेश केवल स्वामी के लिए है!**")
         return
 
-    uid, name = await resolve_target(client, message)
-    if uid is None:
-        await message.reply_text(
-            "ℹ️ जिसकी अनुमति हटानी है उसके संदेश पर उत्तर (reply) देकर `/disallow` लिखें, "
-            "या `/disallow 123456789` लिखें।"
-        )
-        return
-
-    users = AUTH_USERS.get(message.chat.id, set())
-    if uid in users:
-        users.discard(uid)
-        save_auth()
-        await message.reply_text(f"✅ **{name}** (`{uid}`) की अनुमति हटा दी गई।")
+    arg = message.command[1].lower() if len(message.command) > 1 else ""
+    if arg == "on":
+        PHOTO_QUIZ_OFF.discard(message.chat.id)
+        await message.reply_text("✅ **फोटो से प्रश्न** चालू कर दिया गया।")
+    elif arg == "off":
+        PHOTO_QUIZ_OFF.add(message.chat.id)
+        await message.reply_text("🛑 **फोटो से प्रश्न** बंद कर दिया गया।")
     else:
-        await message.reply_text(f"ℹ️ **{name}** (`{uid}`) को पहले से अनुमति प्राप्त नहीं थी।")
-
-
-@app.on_message(filters.command("allowed") & filters.group)
-async def allowed_list_handler(client: Client, message: Message):
-    if not message.from_user:
-        return
-    if not await can_run_quiz(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ यह आदेश केवल अनुमति प्राप्त उपयोगकर्ता चला सकते हैं।")
-        return
-
-    ids = sorted(AUTH_USERS.get(message.chat.id, set()))
-    if not ids:
-        await message.reply_text("ℹ️ अभी किसी अन्य उपयोगकर्ता को अनुमति नहीं दी गई है। (स्वामी हमेशा चला सकता है)")
-        return
-
-    lines = ["👥 **प्रश्नोत्तरी चलाने की अनुमति प्राप्त उपयोगकर्ता:**\n"]
-    for n, uid in enumerate(ids, 1):
-        try:
-            u = await client.get_users(uid)
-            label = clean(u.first_name or "") or str(uid)
-        except Exception:
-            label = "नाम उपलब्ध नहीं"
-        lines.append(f"{n}. {label} — `{uid}`")
-    await message.reply_text("\n".join(lines))
+        state = "बंद 🛑" if message.chat.id in PHOTO_QUIZ_OFF else "चालू ✅"
+        await message.reply_text(
+            f"📷 **फोटो से प्रश्न:** {state}\n\nबदलने के लिए `/photoquiz on` या `/photoquiz off` लिखें।"
+        )
 
 
 @app.on_message(filters.command("stopquiz"))
 async def stop_handler(client: Client, message: Message):
     if not message.from_user:
         return
-    if not await can_run_quiz(client, message.chat.id, message.from_user.id):
-        await message.reply_text("⛔ आपको प्रश्नोत्तरी रोकने की अनुमति नहीं है!")
+    if not await is_owner(client, message.chat.id, message.from_user.id):
+        await message.reply_text("⛔ केवल स्वामी ही प्रश्नोत्तरी रोक सकता है!")
         return
 
     session = SESSIONS.get(message.chat.id)
@@ -771,9 +807,7 @@ async def set_menu_suggestions():
             BotCommand("ca", "प्रश्नोत्तरी चलाएँ: /ca 10 विषय"),
             BotCommand("score", "अब तक का परिणाम देखें"),
             BotCommand("stopquiz", "चल रही प्रश्नोत्तरी रोकें"),
-            BotCommand("allow", "किसी को प्रश्नोत्तरी की अनुमति दें"),
-            BotCommand("disallow", "किसी की अनुमति हटाएँ"),
-            BotCommand("allowed", "अनुमति प्राप्त उपयोगकर्ताओं की सूची"),
+            BotCommand("photoquiz", "फोटो से प्रश्न चालू/बंद करें"),
             BotCommand("settings", "समय-सीमा की व्यवस्था"),
             BotCommand("setgroup", "समूह को अधिकृत करें"),
             BotCommand("id", "चैट और उपयोगकर्ता आईडी"),
